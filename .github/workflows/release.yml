@@ -22,7 +22,7 @@ jobs:
       run: cargo build --release
 
     - name: Create Release Tarball
-      run: tar -czvf iswitch-v${{ github.ref_name }}.tar.gz -C ./target/release iswitch
+      run: tar -czvf iswitch-${{ github.ref_name }}.tar.gz -C ./target/release iswitch
 
     - name: Create GitHub Release
       id: create_release

@@ -1,0 +1,10 @@
+[package]
+name = "iswitch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+block = "0.1.6"
+cocoa = "0.24"
+core-foundation = "0.9"
+objc = "0.2.7"

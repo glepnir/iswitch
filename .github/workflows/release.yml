@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+
+    - name: Build project
+      run: cargo build --release
+
+    - name: Create Release Tarball
+      run: tar -czvf iswitch-v${{ github.ref_name }}.tar.gz -C ./target/release iswitch
+
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ./iswitch-v${{ github.ref_name }}.tar.gz
+        asset_name: iswitch-v${{ github.ref_name }}.tar.gz
+        asset_content_type: application/gzip
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Publish release
+      uses: softprops/action-gh-release@v1
+      with:
+        body: "Automated release of iswitch."
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

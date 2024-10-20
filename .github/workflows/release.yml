@@ -24,23 +24,21 @@ jobs:
     - name: Create Release Tarball
       run: tar -czvf iswitch-v${{ github.ref_name }}.tar.gz -C ./target/release iswitch
 
+    - name: Create GitHub Release
+      id: create_release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ github.ref_name }}
+        tag_name: ${{ github.ref_name }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ github.event.release.upload_url }}
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
         asset_path: ./iswitch-v${{ github.ref_name }}.tar.gz
         asset_name: iswitch-v${{ github.ref_name }}.tar.gz
         asset_content_type: application/gzip
-
-  release:
-    runs-on: macos-latest
-    needs: build
-    steps:
-    - name: Publish release
-      uses: softprops/action-gh-release@v1
-      with:
-        body: "Automated release of iswitch."
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

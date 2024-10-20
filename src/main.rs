@@ -21,7 +21,6 @@ extern "C" {
 }
 
 const K_TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
-const K_TIS_PROPERTY_LOCALIZED_NAME: &str = "TISPropertyLocalizedName";
 
 fn get_current_input_source() -> String {
     unsafe {
@@ -29,11 +28,17 @@ fn get_current_input_source() -> String {
         if !current_source.is_null() {
             let source_name = TISGetInputSourceProperty(
                 current_source,
-                CFString::new(K_TIS_PROPERTY_LOCALIZED_NAME).as_concrete_TypeRef(),
+                CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
             );
             if !source_name.is_null() {
                 let cf_str: CFString = TCFType::wrap_under_get_rule(source_name as CFStringRef);
-                return cf_str.to_string();
+                let source_id = cf_str.to_string();
+                #[cfg(debug_assertions)]
+                {
+                    println!("Current input source ID: {}", source_id);
+                }
+
+                return source_id;
             }
         }
         String::from("Unknown")
@@ -98,10 +103,10 @@ fn main() {
                 let current_input_source = get_current_input_source();
                 #[cfg(debug_assertions)]
                 {
-                    println!("current input source: {}", current_input_source);
+                    println!("current input source: {}", current_input_source,);
                 }
 
-                if current_input_source != "ABC" {
+                if current_input_source.find("keylayout.ABC").is_none() {
                     #[cfg(debug_assertions)]
                     {
                         println!("try switch to abc");

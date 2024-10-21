@@ -37,7 +37,6 @@ fn get_current_input_source() -> String {
                 {
                     println!("Current input source ID: {}", source_id);
                 }
-
                 return source_id;
             }
         }
@@ -45,8 +44,8 @@ fn get_current_input_source() -> String {
     }
 }
 
-fn switch_to_abc() {
-    let abc_input_source_id = CFString::new("com.apple.keylayout.ABC");
+fn switch_input_source(input_source_id: &str) {
+    let input_source_cfstring = CFString::new(input_source_id);
     unsafe {
         let source_list: CFArray =
             TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
@@ -66,7 +65,7 @@ fn switch_to_abc() {
                 let source_cfstring: CFString =
                     TCFType::wrap_under_get_rule(source_id as CFStringRef);
 
-                if source_cfstring == abc_input_source_id {
+                if source_cfstring == input_source_cfstring {
                     TISSelectInputSource(source);
                     break;
                 }
@@ -89,6 +88,11 @@ fn is_terminal(app_name: &str) -> bool {
         .any(|&term| app_name.contains(term))
 }
 
+fn is_chat_app(app_name: &str) -> bool {
+    let chat_apps = ["QQ", "WeChat"];
+    chat_apps.iter().any(|&app| app_name.contains(app))
+}
+
 fn is_iswitch_running() -> bool {
     let output = std::process::Command::new("pgrep")
         .arg("iswitch")
@@ -104,7 +108,7 @@ fn main() {
     if args.len() > 1 && args[1] == "--check-and-switch" {
         let current_input_source = get_current_input_source();
         if current_input_source != "com.apple.keylayout.ABC" {
-            switch_to_abc();
+            switch_input_source("com.apple.keylayout.ABC");
         }
         if is_iswitch_running() {
             return;
@@ -132,17 +136,21 @@ fn main() {
 
             if is_terminal(&name) {
                 let current_input_source = get_current_input_source();
-                #[cfg(debug_assertions)]
-                {
-                    println!("current input source: {}", current_input_source,);
-                }
-
                 if !current_input_source.contains("keylayout.ABC") {
                     #[cfg(debug_assertions)]
                     {
-                        println!("try switch to abc");
+                        println!("Switching to ABC input");
                     }
-                    switch_to_abc();
+                    switch_input_source("com.apple.keylayout.ABC");
+                }
+            } else if is_chat_app(&name) {
+                let current_input_source = get_current_input_source();
+                if !current_input_source.contains("pinyin") {
+                    #[cfg(debug_assertions)]
+                    {
+                        println!("Switching to Pinyin input");
+                    }
+                    switch_input_source("com.apple.inputmethod.SCIM.ITABC");
                 }
             }
         });

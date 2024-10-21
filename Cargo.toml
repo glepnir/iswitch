@@ -7,4 +7,7 @@ edition = "2021"
 block = "0.1.6"
 cocoa = "0.24"
 core-foundation = "0.9"
+notify = "6.1.1"
 objc = "0.2.7"
+serde = { version = "1.0.210", features = ["derive"] }
+toml = "0.8.19"

@@ -76,7 +76,17 @@ fn switch_to_abc() {
 }
 
 fn is_terminal(app_name: &str) -> bool {
-    app_name == "Alacritty"
+    let supported_terminals = [
+        "Alacritty",
+        "Kitty",
+        "Terminal",
+        "iTerm",
+        "Ghosttty",
+        "foot",
+    ];
+    supported_terminals
+        .iter()
+        .any(|&term| app_name.contains(term))
 }
 
 fn is_iswitch_running() -> bool {

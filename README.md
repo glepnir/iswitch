@@ -23,4 +23,7 @@ au('InsertLeave', {
 })
 ```
 
+## TODO
+- linux support
+
 ## LICENSE MIT

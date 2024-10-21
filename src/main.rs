@@ -79,7 +79,28 @@ fn is_terminal(app_name: &str) -> bool {
     app_name == "Alacritty"
 }
 
+fn is_iswitch_running() -> bool {
+    let output = std::process::Command::new("pgrep")
+        .arg("iswitch")
+        .output()
+        .expect("Failed to execute pgrep");
+
+    !output.stdout.is_empty()
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() > 1 && args[1] == "--check-and-switch" {
+        let current_input_source = get_current_input_source();
+        if current_input_source != "com.apple.keylayout.ABC" {
+            switch_to_abc();
+        }
+        if is_iswitch_running() {
+            return;
+        }
+    }
+
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
         let notification_center: id = msg_send![workspace, notificationCenter];
@@ -106,7 +127,7 @@ fn main() {
                     println!("current input source: {}", current_input_source,);
                 }
 
-                if current_input_source.find("keylayout.ABC").is_none() {
+                if !current_input_source.contains("keylayout.ABC") {
                     #[cfg(debug_assertions)]
                     {
                         println!("try switch to abc");

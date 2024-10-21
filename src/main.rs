@@ -170,7 +170,27 @@ fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
     });
 }
 
+fn is_iswitch_running() -> bool {
+    let output = std::process::Command::new("pgrep")
+        .arg("iswitch")
+        .output()
+        .expect("Failed to execute pgrep");
+
+    !output.stdout.is_empty()
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--check-and-switch" {
+        let current_input_source = get_current_input_source();
+        if current_input_source != "com.apple.keylayout.ABC" {
+            switch_input_source("com.apple.keylayout.ABC");
+        }
+        if is_iswitch_running() {
+            return;
+        }
+    }
+
     let config_path = get_config_path();
     let config = Arc::new(RwLock::new(ensure_then_load(&config_path)));
 

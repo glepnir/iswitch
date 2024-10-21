@@ -1,5 +1,5 @@
 # iswitch
-auto switch input source to ABC when forcus on terminal (Alacritty) on macos-arm
+auto switch input source to ABC when forcus on terminal on macos-arm
 
 # Integration with editor
 

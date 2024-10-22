@@ -1,5 +1,5 @@
 # iswitch
-auto switch input source by your rules.
+auto switch input source according your rules.
 
 # Usage
 
@@ -25,12 +25,12 @@ iswitch will check if an iswitch process is already running. If no iswitch
 process is found, iswitch will not exit; it will remain running.
 
 ```lua
-au('InsertLeave', {
+vim.api.nvim_create_autocmd('InsertLeave', {
   callback = function()
     if vim.fn.executable('iswitch') == 0 then
       return
     end
-    vim.system({ 'iswitch', '--check-and-switch' }, nil, function(proc)
+    vim.system({ 'iswitch', '-s', 'com.apple.keylayout.ABC' }, nil, function(proc)
       if proc.code ~= 0 then
         api.nvim_err_writeln('Failed to switch input source: ' .. proc.stderr)
       end

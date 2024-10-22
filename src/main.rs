@@ -191,6 +191,27 @@ async fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "-s" {
+        if args.len() > 2 {
+            let desired_input_source = &args[2];
+            let current_input_source = get_current_input_source();
+            if current_input_source != *desired_input_source {
+                #[cfg(debug_assertions)]
+                {
+                    println!(
+                        "Switching input source from {} to {}",
+                        current_input_source, desired_input_source
+                    );
+                }
+                switch_input_source(desired_input_source);
+            }
+        } else {
+            eprintln!("No input source specified. Usage: -s <input_source_id>");
+        }
+        return;
+    }
+
     let config_path = get_config_path();
     let config = Arc::new(RwLock::new(ensure_then_load(&config_path).await));
 

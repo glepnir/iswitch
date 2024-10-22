@@ -5,6 +5,7 @@ auto switch input source according your rules. now only support macos.
 
 iswitch will read the config file from `XDG_CONFIG_HOME/iswitch/config.toml`.
 if config file not exist it will auto create config file with empty rule.
+support hotreloading config.
 
 example config file format
 

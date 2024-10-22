@@ -10,4 +10,5 @@ core-foundation = "0.9"
 notify = "6.1.1"
 objc = "0.2.7"
 serde = { version = "1.0.210", features = ["derive"] }
+tokio = { version = "1.41.0", features = ["full"] }
 toml = "0.8.19"

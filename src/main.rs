@@ -8,17 +8,17 @@ use core_foundation::string::{CFString, CFStringRef};
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use objc::{class, msg_send, sel, sel_impl};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::{
-    collections::HashMap,
-    fs,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
+use std::sync::RwLock as StdRwLock;
+use std::time::Instant;
+use tokio::fs;
+use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::RwLock;
+use tokio::time::Duration;
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -57,27 +57,28 @@ fn get_config_path() -> String {
     final_path.to_string_lossy().to_string()
 }
 
-fn ensure_then_load(config_path: &str) -> AppConfig {
+async fn ensure_then_load(config_path: &str) -> AppConfig {
     let path = Path::new(config_path);
     println!("Config path: {}, exist: {}", config_path, path.exists());
 
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("Failed to create config directory");
+            fs::create_dir_all(parent)
+                .await
+                .expect("Failed to create config directory");
         }
 
         let default_config = r#"
 [app]
-Alacritty = "com.apple.keylayout.ABC"
-WeChat = "com.apple.inputmethod.SCIM.ITABC"
-QQ = "com.apple.inputmethod.SCIM.ITABC"
 "#;
 
-        fs::write(path, default_config.trim()).expect("Failed to write default config file");
+        fs::write(path, default_config.trim())
+            .await
+            .expect("Failed to write default config file");
         println!("Created default config file at: {}", config_path);
     }
 
-    match fs::read_to_string(config_path) {
+    match fs::read_to_string(config_path).await {
         Ok(config_content) => {
             println!("Config content read: {}", config_content);
 
@@ -149,48 +150,52 @@ fn switch_input_source(input_source_id: &str) {
     }
 }
 
-fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
-    let last_update_time = Arc::new(RwLock::new(Instant::now()));
+async fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
+    let debounce_duration = Duration::from_millis(500);
+    let last_update_time = Arc::new(StdRwLock::new(Instant::now()));
 
-    thread::spawn({
-        let last_update_time = Arc::clone(&last_update_time);
-        move || {
-            let mut watcher = RecommendedWatcher::new(
-                move |res: notify::Result<Event>| {
-                    if let Ok(event) = res {
-                        if matches!(event.kind, EventKind::Modify(_)) {
-                            let now = Instant::now();
-                            let mut last_update = last_update_time.write().unwrap();
+    let (watcher_tx, mut watcher_rx) = channel(1);
 
-                            if now.duration_since(*last_update) > Duration::from_millis(500) {
-                                *last_update = now;
-                                println!("Config file changed, reloading...");
-                                tx.send(()).unwrap();
-                            }
+    tokio::task::spawn_blocking(move || {
+        let mut watcher = RecommendedWatcher::new(
+            move |res: notify::Result<Event>| {
+                if let Ok(event) = res {
+                    if matches!(event.kind, EventKind::Modify(_)) {
+                        let now = Instant::now();
+                        let mut last_update = last_update_time.write().unwrap();
+
+                        if now.duration_since(*last_update) > debounce_duration {
+                            *last_update = now;
+                            watcher_tx.blocking_send(()).unwrap();
                         }
                     }
-                },
-                Config::default(),
-            )
-            .expect("Failed to create watcher");
+                }
+            },
+            Config::default(),
+        )
+        .expect("Failed to create watcher");
 
-            watcher
-                .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-                .expect("Failed to watch config file");
+        watcher
+            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
+            .expect("Failed to watch config file");
 
-            loop {
-                std::thread::park();
-            }
+        loop {
+            std::thread::park();
         }
     });
+
+    while let Some(()) = watcher_rx.recv().await {
+        tx.send(()).await.unwrap();
+    }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config_path = get_config_path();
-    let config = Arc::new(RwLock::new(ensure_then_load(&config_path)));
+    let config = Arc::new(RwLock::new(ensure_then_load(&config_path).await));
 
-    let (tx, rx) = channel();
-    watch_config_for_changes(config_path.clone(), tx);
+    let (tx, mut rx) = channel(10); // buffer is enough?
+    tokio::spawn(watch_config_for_changes(config_path.clone(), tx));
 
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
@@ -212,18 +217,18 @@ fn main() {
                     println!("Current app {}", name);
                 }
 
-                if let Ok(current_config) = config.read() {
-                    if let Some(input_source) = current_config.app.get(&name) {
-                        let current_input_source = get_current_input_source();
-                        if !current_input_source.contains(input_source) {
-                            #[cfg(debug_assertions)]
-                            {
+                tokio::spawn({
+                    let config = Arc::clone(&config);
+                    async move {
+                        if let Some(input_source) = config.read().await.app.get(&name) {
+                            let current_input_source = get_current_input_source();
+                            if !current_input_source.contains(input_source) {
                                 println!("Switching to input: {}", input_source);
+                                switch_input_source(input_source);
                             }
-                            switch_input_source(input_source);
                         }
                     }
-                }
+                });
             }
         });
 
@@ -239,14 +244,13 @@ fn main() {
 
         loop {
             if let Ok(()) = rx.try_recv() {
-                let new_config = ensure_then_load(&config_path);
-                if let Ok(mut locked_config) = config.write() {
-                    if *locked_config != new_config {
-                        *locked_config = new_config;
-                        println!("Config reloaded: {:?}", *locked_config);
-                    } else {
-                        println!("No changes in config, skipping reload.");
-                    }
+                let new_config = ensure_then_load(&config_path).await;
+                let mut locked_config = config.write().await;
+                if *locked_config != new_config {
+                    *locked_config = new_config;
+                    println!("Config reloaded: {:?}", *locked_config);
+                } else {
+                    println!("No changes in config, skipping reload.");
                 }
             }
 

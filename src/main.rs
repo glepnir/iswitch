@@ -14,7 +14,11 @@ use std::ptr;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+    time::{Duration, Instant},
+};
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -30,7 +34,7 @@ extern "C" {
 const K_TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
 const K_CF_RUN_LOOP_DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq)]
 struct AppConfig {
     app: HashMap<String, String>,
 }
@@ -146,51 +150,42 @@ fn switch_input_source(input_source_id: &str) {
 }
 
 fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
-    thread::spawn(move || {
-        let mut watcher = RecommendedWatcher::new(
-            move |res: notify::Result<Event>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_)) {
-                        println!("Config file changed, reloading...");
-                        tx.send(()).unwrap();
+    let last_update_time = Arc::new(RwLock::new(Instant::now()));
+
+    thread::spawn({
+        let last_update_time = Arc::clone(&last_update_time);
+        move || {
+            let mut watcher = RecommendedWatcher::new(
+                move |res: notify::Result<Event>| {
+                    if let Ok(event) = res {
+                        if matches!(event.kind, EventKind::Modify(_)) {
+                            let now = Instant::now();
+                            let mut last_update = last_update_time.write().unwrap();
+
+                            if now.duration_since(*last_update) > Duration::from_millis(500) {
+                                *last_update = now;
+                                println!("Config file changed, reloading...");
+                                tx.send(()).unwrap();
+                            }
+                        }
                     }
-                }
-            },
-            Config::default(),
-        )
-        .expect("Failed to create watcher");
+                },
+                Config::default(),
+            )
+            .expect("Failed to create watcher");
 
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .expect("Failed to watch config file");
+            watcher
+                .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
+                .expect("Failed to watch config file");
 
-        loop {
-            std::thread::park();
+            loop {
+                std::thread::park();
+            }
         }
     });
 }
 
-fn is_iswitch_running() -> bool {
-    let output = std::process::Command::new("pgrep")
-        .arg("iswitch")
-        .output()
-        .expect("Failed to execute pgrep");
-
-    !output.stdout.is_empty()
-}
-
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "--check-and-switch" {
-        let current_input_source = get_current_input_source();
-        if current_input_source != "com.apple.keylayout.ABC" {
-            switch_input_source("com.apple.keylayout.ABC");
-        }
-        if is_iswitch_running() {
-            return;
-        }
-    }
-
     let config_path = get_config_path();
     let config = Arc::new(RwLock::new(ensure_then_load(&config_path)));
 
@@ -246,12 +241,15 @@ fn main() {
             if let Ok(()) = rx.try_recv() {
                 let new_config = ensure_then_load(&config_path);
                 if let Ok(mut locked_config) = config.write() {
-                    *locked_config = new_config;
-                    println!("Config reloaded: {:?}", *locked_config);
+                    if *locked_config != new_config {
+                        *locked_config = new_config;
+                        println!("Config reloaded: {:?}", *locked_config);
+                    } else {
+                        println!("No changes in config, skipping reload.");
+                    }
                 }
             }
 
-            // use `CFRunLoopRunInMode` avoid block
             CFRunLoopRunInMode(
                 CFString::new(K_CF_RUN_LOOP_DEFAULT_MODE).as_concrete_TypeRef(),
                 0.1,

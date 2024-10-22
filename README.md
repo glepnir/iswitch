@@ -1,5 +1,5 @@
 # iswitch
-auto switch input source according your rules.
+auto switch input source according your rules. now only support macos.
 
 # Usage
 
@@ -41,6 +41,7 @@ vim.api.nvim_create_autocmd('InsertLeave', {
 ```
 
 ## TODO
+- print input source names
 - linux support
 
 ## LICENSE MIT

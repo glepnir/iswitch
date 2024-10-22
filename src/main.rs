@@ -159,15 +159,17 @@ async fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
     tokio::task::spawn_blocking(move || {
         let mut watcher = RecommendedWatcher::new(
             move |res: notify::Result<Event>| {
-                if let Ok(event) = res {
-                    if matches!(event.kind, EventKind::Modify(_)) {
-                        let now = Instant::now();
-                        let mut last_update = last_update_time.write().unwrap();
+                if let Ok(Event {
+                    kind: EventKind::Modify(_),
+                    ..
+                }) = res
+                {
+                    let now = Instant::now();
+                    let mut last_update = last_update_time.write().unwrap();
 
-                        if now.duration_since(*last_update) > debounce_duration {
-                            *last_update = now;
-                            watcher_tx.blocking_send(()).unwrap();
-                        }
+                    if now.duration_since(*last_update) > debounce_duration {
+                        *last_update = now;
+                        watcher_tx.blocking_send(()).unwrap();
                     }
                 }
             },
@@ -178,10 +180,6 @@ async fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
         watcher
             .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
             .expect("Failed to watch config file");
-
-        loop {
-            std::thread::park();
-        }
     });
 
     while let Some(()) = watcher_rx.recv().await {

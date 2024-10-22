@@ -1,6 +1,5 @@
 # iswitch
-auto switch input source to ABC when forcus on terminal.
-auto switch to PinYin when focus on wechat or qq. only support macos-arm now.
+auto switch input source by your rules.
 
 # Usage
 

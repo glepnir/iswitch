@@ -184,27 +184,120 @@ async fn watch_config_for_changes(
     }
 }
 
+fn print_available_input_sources() {
+    unsafe {
+        let source_list: CFArray =
+            TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
+
+        for i in 0..source_list.len() {
+            let source = match source_list.get(i as isize) {
+                Some(item) => item.as_void_ptr() as CFTypeRef,
+                None => ptr::null(),
+            };
+
+            let source_id = TISGetInputSourceProperty(
+                source as CFTypeRef,
+                CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
+            );
+
+            if !source_id.is_null() {
+                let source_cfstring: CFString =
+                    TCFType::wrap_under_get_rule(source_id as CFStringRef);
+
+                let localized_name = TISGetInputSourceProperty(
+                    source,
+                    CFString::new("TISPropertyLocalizedName").as_concrete_TypeRef(),
+                );
+                let localized_name_str = if !localized_name.is_null() {
+                    let localized_cfstring: CFString =
+                        TCFType::wrap_under_get_rule(localized_name as CFStringRef);
+                    localized_cfstring.to_string()
+                } else {
+                    let input_mode_id = TISGetInputSourceProperty(
+                        source,
+                        CFString::new("TISPropertyInputModeID").as_concrete_TypeRef(),
+                    );
+
+                    if !input_mode_id.is_null() {
+                        let input_mode_cfstring: CFString =
+                            TCFType::wrap_under_get_rule(input_mode_id as CFStringRef);
+                        input_mode_cfstring.to_string()
+                    } else {
+                        let input_languages = TISGetInputSourceProperty(
+                            source,
+                            CFString::new("TISPropertyInputSourceLanguages").as_concrete_TypeRef(),
+                        );
+
+                        if !input_languages.is_null() {
+                            let languages: CFArray =
+                                TCFType::wrap_under_get_rule(input_languages as CFArrayRef);
+                            let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
+                                let lang_ptr: *const c_void = item.as_void_ptr();
+                                let lang_str: CFString =
+                                    TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
+                                lang_str.to_string()
+                            });
+                            lang
+                        } else {
+                            let input_type = TISGetInputSourceProperty(
+                                source,
+                                CFString::new("TISPropertyInputSourceType").as_concrete_TypeRef(),
+                            );
+
+                            if !input_type.is_null() {
+                                let input_type_cfstring: CFString =
+                                    TCFType::wrap_under_get_rule(input_type as CFStringRef);
+                                format!("Unknown ({})", input_type_cfstring.to_string())
+                            } else {
+                                println!("Localized name is null for source: {}", source_cfstring);
+                                "Unknown".to_string()
+                            }
+                        }
+                    }
+                };
+
+                println!("{}, {}", source_cfstring, localized_name_str);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "-s" {
-        if args.len() > 2 {
-            let desired_input_source = &args[2];
-            let current_input_source = get_current_input_source();
-            if current_input_source != *desired_input_source {
-                #[cfg(debug_assertions)]
-                {
-                    println!(
-                        "Switching input source from {} to {}",
-                        current_input_source, desired_input_source
-                    );
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "-s" => {
+                if args.len() > 2 {
+                    let desired_input_source = &args[2];
+                    let current_input_source = get_current_input_source();
+                    if current_input_source != *desired_input_source {
+                        #[cfg(debug_assertions)]
+                        {
+                            println!(
+                                "Switching input source from {} to {}",
+                                current_input_source, desired_input_source
+                            );
+                        }
+                        switch_input_source(desired_input_source);
+                    }
+                } else {
+                    eprintln!("No input source specified. Usage: -s <input_source_id>");
                 }
-                switch_input_source(desired_input_source);
+                return;
             }
-        } else {
-            eprintln!("No input source specified. Usage: -s <input_source_id>");
+            "-p" => {
+                print_available_input_sources();
+                return;
+            }
+            _ => {
+                eprintln!(
+                    "Unknown option: {}. Usage: -s <input_source_id> or -p",
+                    args[1]
+                );
+                return;
+            }
         }
-        return;
     }
 
     let config_path = get_config_path();

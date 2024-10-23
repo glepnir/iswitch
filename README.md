@@ -42,7 +42,6 @@ vim.api.nvim_create_autocmd('InsertLeave', {
 ```
 
 ## TODO
-- print input source names
 - linux support
 
 ## LICENSE MIT

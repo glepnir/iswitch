@@ -186,6 +186,7 @@ async fn watch_config_for_changes(
 
 fn print_available_input_sources() {
     unsafe {
+        // TODO: clean up move to a single function that i can reuse in switch_input_source
         let source_list: CFArray =
             TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
 

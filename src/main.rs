@@ -12,13 +12,10 @@ use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
-use tokio::sync::RwLock;
-use tokio::time::Duration;
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -68,10 +65,7 @@ async fn ensure_then_load(config_path: &str) -> AppConfig {
                 .expect("Failed to create config directory");
         }
 
-        let default_config = r#"
-[app]
-"#;
-
+        let default_config = r#"[app]"#;
         fs::write(path, default_config.trim())
             .await
             .expect("Failed to write default config file");
@@ -150,37 +144,40 @@ fn switch_input_source(input_source_id: &str) {
     }
 }
 
-async fn watch_config_for_changes(config_path: String, tx: Sender<()>) {
+async fn watch_config_for_changes(
+    config_path: String,
+    tx: Sender<()>,
+    last_update_time: Arc<Mutex<Instant>>,
+) {
     let debounce_duration = Duration::from_millis(500);
-    let last_update_time = Arc::new(StdRwLock::new(Instant::now()));
 
     let (watcher_tx, mut watcher_rx) = channel(1);
 
-    tokio::task::spawn_blocking(move || {
-        let mut watcher = RecommendedWatcher::new(
-            move |res: notify::Result<Event>| {
-                if let Ok(Event {
-                    kind: EventKind::Modify(_),
-                    ..
-                }) = res
-                {
-                    let now = Instant::now();
-                    let mut last_update = last_update_time.write().unwrap();
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<Event>| {
+            if let Ok(Event {
+                kind: EventKind::Modify(_),
+                ..
+            }) = res
+            {
+                let now = Instant::now();
+                let mut last_update = last_update_time.lock().unwrap();
 
-                    if now.duration_since(*last_update) > debounce_duration {
-                        *last_update = now;
-                        watcher_tx.blocking_send(()).unwrap();
+                if now.duration_since(*last_update) > debounce_duration {
+                    *last_update = now;
+                    if watcher_tx.try_send(()).is_err() {
+                        eprintln!("Failed to send file event update");
                     }
                 }
-            },
-            Config::default(),
-        )
-        .expect("Failed to create watcher");
+            }
+        },
+        Config::default(),
+    )
+    .expect("Failed to create watcher");
 
-        watcher
-            .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-            .expect("Failed to watch config file");
-    });
+    watcher
+        .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
+        .expect("Failed to watch config file");
 
     while let Some(()) = watcher_rx.recv().await {
         tx.send(()).await.unwrap();
@@ -211,10 +208,15 @@ async fn main() {
     }
 
     let config_path = get_config_path();
-    let config = Arc::new(RwLock::new(ensure_then_load(&config_path).await));
+    let config = Arc::new(Mutex::new(ensure_then_load(&config_path).await));
+    let last_update_time = Arc::new(Mutex::new(Instant::now()));
 
     let (tx, mut rx) = channel(10); // buffer is enough?
-    tokio::spawn(watch_config_for_changes(config_path.clone(), tx));
+    tokio::spawn(watch_config_for_changes(
+        config_path.clone(),
+        tx,
+        last_update_time.clone(),
+    ));
 
     unsafe {
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
@@ -236,15 +238,13 @@ async fn main() {
                     println!("Current app {}", name);
                 }
 
-                tokio::spawn({
-                    let config = Arc::clone(&config);
-                    async move {
-                        if let Some(input_source) = config.read().await.app.get(&name) {
-                            let current_input_source = get_current_input_source();
-                            if !current_input_source.contains(input_source) {
-                                println!("Switching to input: {}", input_source);
-                                switch_input_source(input_source);
-                            }
+                let config = Arc::clone(&config);
+                tokio::spawn(async move {
+                    if let Some(input_source) = config.lock().unwrap().app.get(&name) {
+                        let current_input_source = get_current_input_source();
+                        if !current_input_source.contains(input_source) {
+                            println!("Switching to input: {}", input_source);
+                            switch_input_source(input_source);
                         }
                     }
                 });
@@ -264,7 +264,7 @@ async fn main() {
         loop {
             if let Ok(()) = rx.try_recv() {
                 let new_config = ensure_then_load(&config_path).await;
-                let mut locked_config = config.write().await;
+                let mut locked_config = config.lock().unwrap();
                 if *locked_config != new_config {
                     *locked_config = new_config;
                     println!("Config reloaded: {:?}", *locked_config);
@@ -275,7 +275,7 @@ async fn main() {
 
             CFRunLoopRunInMode(
                 CFString::new(K_CF_RUN_LOOP_DEFAULT_MODE).as_concrete_TypeRef(),
-                0.1,
+                1.0,
                 false as u8,
             );
         }

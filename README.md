@@ -16,6 +16,11 @@ WeChat = "com.apple.inputmethod.SCIM.ITABC"
 QQ = "com.apple.inputmethod.SCIM.ITABC"
 ```
 
+### Command Line Argument
+
+- `-s` with switch input source id
+- `-p` print all available input source list with localized name if found.
+
 # Integration with editor
 
 ## neovim

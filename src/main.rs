@@ -12,10 +12,13 @@ use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::{
+    mpsc::{channel, Sender},
+    RwLock,
+};
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -144,10 +147,19 @@ fn switch_input_source(input_source_id: &str) {
     }
 }
 
+fn is_iswitch_running() -> bool {
+    let output = std::process::Command::new("pgrep")
+        .arg("iswitch")
+        .output()
+        .expect("Failed to execute pgrep");
+
+    !output.stdout.is_empty()
+}
+
 async fn watch_config_for_changes(
     config_path: String,
     tx: Sender<()>,
-    last_update_time: Arc<Mutex<Instant>>,
+    last_update_time: Arc<RwLock<Instant>>,
 ) {
     let debounce_duration = Duration::from_millis(500);
 
@@ -161,7 +173,7 @@ async fn watch_config_for_changes(
             }) = res
             {
                 let now = Instant::now();
-                let mut last_update = last_update_time.lock().unwrap();
+                let mut last_update = last_update_time.blocking_write();
 
                 if now.duration_since(*last_update) > debounce_duration {
                     *last_update = now;
@@ -186,7 +198,6 @@ async fn watch_config_for_changes(
 
 fn print_available_input_sources() {
     unsafe {
-        // TODO: clean up move to a single function that i can reuse in switch_input_source
         let source_list: CFArray =
             TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
 
@@ -224,36 +235,7 @@ fn print_available_input_sources() {
                             TCFType::wrap_under_get_rule(input_mode_id as CFStringRef);
                         input_mode_cfstring.to_string()
                     } else {
-                        let input_languages = TISGetInputSourceProperty(
-                            source,
-                            CFString::new("TISPropertyInputSourceLanguages").as_concrete_TypeRef(),
-                        );
-
-                        if !input_languages.is_null() {
-                            let languages: CFArray =
-                                TCFType::wrap_under_get_rule(input_languages as CFArrayRef);
-                            let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
-                                let lang_ptr: *const c_void = item.as_void_ptr();
-                                let lang_str: CFString =
-                                    TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
-                                lang_str.to_string()
-                            });
-                            lang
-                        } else {
-                            let input_type = TISGetInputSourceProperty(
-                                source,
-                                CFString::new("TISPropertyInputSourceType").as_concrete_TypeRef(),
-                            );
-
-                            if !input_type.is_null() {
-                                let input_type_cfstring: CFString =
-                                    TCFType::wrap_under_get_rule(input_type as CFStringRef);
-                                format!("Unknown ({})", input_type_cfstring.to_string())
-                            } else {
-                                println!("Localized name is null for source: {}", source_cfstring);
-                                "Unknown".to_string()
-                            }
-                        }
+                        "Unknown".to_string()
                     }
                 };
 
@@ -261,15 +243,6 @@ fn print_available_input_sources() {
             }
         }
     }
-}
-
-fn is_iswitch_running() -> bool {
-    let output = std::process::Command::new("pgrep")
-        .arg("iswitch")
-        .output()
-        .expect("Failed to execute pgrep");
-
-    !output.stdout.is_empty()
 }
 
 #[tokio::main]
@@ -292,13 +265,13 @@ async fn main() {
                         switch_input_source(desired_input_source);
                     }
 
-                    // already have a iswitch progress
                     if is_iswitch_running() {
                         return;
                     }
                 } else {
                     eprintln!("No input source specified. Usage: -s <input_source_id>");
                 }
+                return;
             }
             "-p" => {
                 print_available_input_sources();
@@ -315,10 +288,10 @@ async fn main() {
     }
 
     let config_path = get_config_path();
-    let config = Arc::new(Mutex::new(ensure_then_load(&config_path).await));
-    let last_update_time = Arc::new(Mutex::new(Instant::now()));
+    let config = Arc::new(RwLock::new(ensure_then_load(&config_path).await));
+    let last_update_time = Arc::new(RwLock::new(Instant::now()));
 
-    let (tx, mut rx) = channel(10); // buffer is enough?
+    let (tx, mut rx) = channel(10);
     tokio::spawn(watch_config_for_changes(
         config_path.clone(),
         tx,
@@ -347,7 +320,7 @@ async fn main() {
 
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
-                    if let Some(input_source) = config.lock().unwrap().app.get(&name) {
+                    if let Some(input_source) = config.read().await.app.get(&name) {
                         let current_input_source = get_current_input_source();
                         if !current_input_source.contains(input_source) {
                             println!("Switching to input: {}", input_source);
@@ -371,7 +344,7 @@ async fn main() {
         loop {
             if let Ok(()) = rx.try_recv() {
                 let new_config = ensure_then_load(&config_path).await;
-                let mut locked_config = config.lock().unwrap();
+                let mut locked_config = config.write().await;
                 if *locked_config != new_config {
                     *locked_config = new_config;
                     println!("Config reloaded: {:?}", *locked_config);
@@ -382,7 +355,7 @@ async fn main() {
 
             CFRunLoopRunInMode(
                 CFString::new(K_CF_RUN_LOOP_DEFAULT_MODE).as_concrete_TypeRef(),
-                1.0,
+                0.5,
                 false as u8,
             );
         }

@@ -263,6 +263,15 @@ fn print_available_input_sources() {
     }
 }
 
+fn is_iswitch_running() -> bool {
+    let output = std::process::Command::new("pgrep")
+        .arg("iswitch")
+        .output()
+        .expect("Failed to execute pgrep");
+
+    !output.stdout.is_empty()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -282,10 +291,14 @@ async fn main() {
                         }
                         switch_input_source(desired_input_source);
                     }
+
+                    // already have a iswitch progress
+                    if is_iswitch_running() {
+                        return;
+                    }
                 } else {
                     eprintln!("No input source specified. Usage: -s <input_source_id>");
                 }
-                return;
             }
             "-p" => {
                 print_available_input_sources();

@@ -271,7 +271,6 @@ async fn main() {
                 } else {
                     eprintln!("No input source specified. Usage: -s <input_source_id>");
                 }
-                return;
             }
             "-p" => {
                 print_available_input_sources();

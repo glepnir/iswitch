@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
+mod logger;
+use logger::{LogLevel, Logger};
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {

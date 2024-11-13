@@ -11,13 +11,12 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
-mod logger;
-use logger::{LogLevel, Logger};
 
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
@@ -264,6 +263,14 @@ fn print_available_input_sources() {
     }
 }
 
+fn is_iswitch_running() -> bool {
+    let output = Command::new("pgrep")
+        .arg("iswitch")
+        .output()
+        .expect("Failed to execute pgrep");
+    !output.stdout.is_empty()
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -283,10 +290,13 @@ async fn main() {
                         }
                         switch_input_source(desired_input_source);
                     }
+                    if is_iswitch_running() {
+                        return;
+                    }
                 } else {
                     eprintln!("No input source specified. Usage: -s <input_source_id>");
+                    return;
                 }
-                return;
             }
             "-p" => {
                 print_available_input_sources();
@@ -370,7 +380,7 @@ async fn main() {
 
             CFRunLoopRunInMode(
                 CFString::new(K_CF_RUN_LOOP_DEFAULT_MODE).as_concrete_TypeRef(),
-                1.0,
+                0.5,
                 false as u8,
             );
         }

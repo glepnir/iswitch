@@ -1,44 +1,38 @@
 name: Release
-
 on:
   push:
     tags:
       - 'v*'
-
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
     - uses: actions/checkout@v3
-
     - name: Set up Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
         override: true
-
     - name: Build project
       run: cargo build --release
 
-    - name: Create Release Tarball
+    # Create versioned tarball
+    - name: Create Versioned Tarball
       run: tar -czvf iswitch-${{ github.ref_name }}.tar.gz -C ./target/release iswitch
 
+    # Create a consistent named tarball for "latest"
+    - name: Create Latest Tarball
+      run: tar -czvf iswitch-macos.tar.gz -C ./target/release iswitch
+
+    # Create Release
     - name: Create GitHub Release
       id: create_release
       uses: softprops/action-gh-release@v1
       with:
         name: Release ${{ github.ref_name }}
         tag_name: ${{ github.ref_name }}
+        files: |
+          ./iswitch-${{ github.ref_name }}.tar.gz
+          ./iswitch-macos.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Upload Release Asset
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./iswitch-${{ github.ref_name }}.tar.gz
-        asset_name: iswitch.tar.gz
-        asset_content_type: application/gzip

@@ -10,6 +10,7 @@ support hotreloading config.
 example config file format
 
 ```toml
+[app]
 # Examples of application-to-input-source mappings
 # Format: "Application Name" = "InputSourceID"
 # 

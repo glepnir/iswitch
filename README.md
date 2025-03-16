@@ -1,6 +1,15 @@
 # iswitch
 auto switch input source according your rules. now only support macos.
 
+# Install
+
+- With homebrew
+
+```
+brew tap glepnir/iswitch
+brew install iswitch
+```
+
 # Usage
 
 iswitch will read the config file from `XDG_CONFIG_HOME/iswitch/config.toml`.

@@ -33,7 +33,7 @@ enabled = false
 # Log level: trace, debug, info, warn, error
 level = "info"
 # Log file path
-file = "~/Library/Logs/iswitch.log"
+file = "~/.config/iswitch/iswitch.log"
 ```
 
 ### Command Line Argument

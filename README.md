@@ -9,6 +9,7 @@ auto switch input source according your rules. now only support macos.
 brew tap glepnir/iswitch
 brew install iswitch
 ```
+uninstall `brew untap glepnir/iswitch`
 
 # Usage
 

@@ -493,11 +493,23 @@ async fn main() {
                     return;
                 }
             }
-            _ => {
-                error!(
-                    "Unknown option: {}. Usage: -s <input_source_id> or -p",
-                    args[1]
+            "-h" | "--help" => {
+                println!(
+                    "iSwitch - Automatically switch input sources based on active application"
                 );
+                println!("\nUSAGE:");
+                println!(
+                    "  iswitch              Start in daemon mode and monitor application changes"
+                );
+                println!("  iswitch -s <input>   Switch to the specified input source");
+                println!("  iswitch -p           Print all available input sources");
+                println!("  iswitch -h           Show this help message");
+                println!("\nCONFIGURATION:");
+                println!("  Configuration file is located at ~/.config/iswitch/config.toml");
+                return;
+            }
+            _ => {
+                error!("Unknown option: {}. Use -h for help.", args[1]);
                 return;
             }
         }

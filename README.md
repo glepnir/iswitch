@@ -10,10 +10,19 @@ support hotreloading config.
 example config file format
 
 ```toml
-[app]
-Alacritty = "com.apple.keylayout.ABC"
-WeChat = "com.apple.inputmethod.SCIM.ITABC"
-QQ = "com.apple.inputmethod.SCIM.ITABC"
+# Examples of application-to-input-source mappings
+# Format: "Application Name" = "InputSourceID"
+# 
+# "Terminal" = "com.apple.keylayout.US"
+# "Safari" = "com.apple.inputmethod.TCIM.Pinyin"
+
+[debug]
+# Enable debugging
+enabled = false
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log file path
+file = "~/Library/Logs/iswitch.log"
 ```
 
 ### Command Line Argument
@@ -38,7 +47,7 @@ vim.api.nvim_create_autocmd('InsertLeave', {
     end
     vim.system({ 'iswitch', '-s', 'com.apple.keylayout.ABC' }, nil, function(proc)
       if proc.code ~= 0 then
-        api.nvim_err_writeln('Failed to switch input source: ' .. proc.stderr)
+        vim.notify('Failed to switch input source: ' .. proc.stderr, vim.log.levels.Warn)
       end
     end)
   end,

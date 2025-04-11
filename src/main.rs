@@ -7,6 +7,7 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{Boolean, CFTypeRef, TCFType, TCFTypeRef};
 use core_foundation::runloop::CFRunLoopRunInMode;
 use core_foundation::string::{CFString, CFStringRef};
+use lazy_static::lazy_static;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use objc::{class, msg_send, sel, sel_impl};
 use serde::Deserialize;
@@ -38,19 +39,29 @@ extern "C" {
 const K_TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
 const K_CF_RUN_LOOP_DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
 
-// Custom log context that can be added to each log
-thread_local! {
-    static APP_CONTEXT: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+// Thread-safe app context using lazy_static and Arc<Mutex<>>
+lazy_static! {
+    static ref APP_CONTEXT: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 }
 
 fn set_app_context(app_name: Option<String>) {
-    APP_CONTEXT.with(|context| {
-        *context.borrow_mut() = app_name;
-    });
+    if let Ok(mut context) = APP_CONTEXT.lock() {
+        *context = app_name;
+    } else {
+        // Handle potential poisoned mutex to avoid panics
+        eprintln!("Warning: Failed to set app context - mutex was poisoned");
+    }
 }
 
 fn get_app_context() -> Option<String> {
-    APP_CONTEXT.with(|context| context.borrow().clone())
+    match APP_CONTEXT.lock() {
+        Ok(context) => context.clone(),
+        Err(_) => {
+            // Handle potential poisoned mutex to avoid panics
+            eprintln!("Warning: Failed to get app context - mutex was poisoned");
+            Some("iswitch".to_string()) // Fallback to default
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -85,42 +96,59 @@ fn default_log_level() -> String {
 }
 
 fn default_log_file() -> String {
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{}/Library/Logs/iswitch.log", home_dir)
+    // Use XDG_CONFIG_HOME for log file path if available
+    if let Ok(config_dir) = std::env::var("XDG_CONFIG_HOME") {
+        format!("{}/iswitch/iswitch.log", config_dir)
+    } else {
+        // Fallback to HOME directory if XDG_CONFIG_HOME is not set
+        let home_dir = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/.config/iswitch/iswitch.log", home_dir)
+    }
+}
+
+// Setup console-only logging as a fallback in case of errors
+fn setup_console_only_logging() -> Result<(), fern::InitError> {
+    fern::Dispatch::new()
+        .level(log::LevelFilter::Info)
+        .chain(std::io::stdout())
+        .apply()?;
+
+    eprintln!("Initialized console-only logging due to file logging setup failure");
+    Ok(())
 }
 
 fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
     if !config.debug.enabled {
         // If debugging is not enabled, only configure basic console logging
-        fern::Dispatch::new()
-            .level(log::LevelFilter::Info)
-            .chain(std::io::stdout())
-            .apply()?;
-        return Ok(());
+        return setup_console_only_logging();
     }
 
-    // Parse log level
+    // Parse log level with safe defaults
     let log_level = match config.debug.level.to_lowercase().as_str() {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
         "info" => log::LevelFilter::Info,
         "warn" => log::LevelFilter::Warn,
         "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
+        _ => log::LevelFilter::Info, // Safe default
     };
 
-    // Ensure log file directory exists
+    // Ensure log file directory exists with proper error handling
     let log_file = config
         .debug
         .file
         .replace("~", &std::env::var("HOME").unwrap_or_default());
+
     if let Some(parent) = Path::new(&log_file).parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("Failed to create log directory: {}", e);
-        });
+        if !parent.exists() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Failed to create log directory: {}", e);
+                return setup_console_only_logging();
+            }
+        }
     }
 
-    // Configure log formatter with app context
+    // Configure log formatter with app context and error handling
     let format_fn =
         |out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record| {
             let app_context = get_app_context().unwrap_or_else(|| "iswitch".to_string());
@@ -134,6 +162,15 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
             ))
         };
 
+    // Create file with appropriate error handling
+    let file_result = match fern::log_file(&log_file) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("Failed to open log file {}: {}", log_file, e);
+            return setup_console_only_logging();
+        }
+    };
+
     // Configure log dispatcher
     let dispatch = fern::Dispatch::new()
         .format(format_fn)
@@ -141,18 +178,22 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
         .chain(std::io::stdout()); // Always output to console
 
     // Add file output with the same format
-    let file_config = fern::Dispatch::new()
-        .format(format_fn)
-        .chain(fern::log_file(&log_file)?);
+    let file_config = fern::Dispatch::new().format(format_fn).chain(file_result);
 
     // Merge dispatchers and apply
-    dispatch.chain(file_config).apply()?;
-
-    info!(
-        "Log system initialized, level: {}, log file: {}",
-        config.debug.level, log_file
-    );
-    Ok(())
+    match dispatch.chain(file_config).apply() {
+        Ok(_) => {
+            info!(
+                "Log system initialized, level: {}, log file: {}",
+                config.debug.level, log_file
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize logging system: {}", e);
+            setup_console_only_logging()
+        }
+    }
 }
 
 fn get_config_path() -> String {
@@ -163,7 +204,9 @@ fn get_config_path() -> String {
         path.push(".config");
         path
     } else {
-        panic!("Neither XDG_CONFIG_HOME nor HOME environment variables are set");
+        // Instead of panicking, use a reasonable default
+        eprintln!("Neither XDG_CONFIG_HOME nor HOME environment variables are set, using current directory");
+        PathBuf::from(".")
     };
 
     let mut final_path = config_path;
@@ -183,9 +226,14 @@ async fn ensure_then_load(config_path: &str) -> AppConfig {
 
     if !path.exists() {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .expect("Failed to create config directory");
+            if let Err(e) = fs::create_dir_all(parent).await {
+                error!("Failed to create config directory: {}", e);
+                // Return a default config instead of panicking
+                return AppConfig {
+                    app: HashMap::new(),
+                    debug: DebugConfig::default(),
+                };
+            }
         }
 
         // Richer default configuration, including debug section
@@ -204,9 +252,14 @@ level = "info"
 # Log file path
 file = "~/Library/Logs/iswitch.log"
 "#;
-        fs::write(path, default_config)
-            .await
-            .expect("Failed to write default config file");
+        if let Err(e) = fs::write(path, default_config).await {
+            error!("Failed to write default config file: {}", e);
+            // Return a default config instead of panicking
+            return AppConfig {
+                app: HashMap::new(),
+                debug: DebugConfig::default(),
+            };
+        }
         info!("Created default config file at: {}", config_path);
     }
 
@@ -237,13 +290,21 @@ file = "~/Library/Logs/iswitch.log"
                 Err(e) => {
                     error!("Failed to parse config file: {}", e);
                     error!("Config content: {}", config_content);
-                    std::process::exit(1);
+                    // Return a default config instead of panicking
+                    AppConfig {
+                        app: HashMap::new(),
+                        debug: DebugConfig::default(),
+                    }
                 }
             }
         }
         Err(e) => {
             error!("Unable to read config file: {}", e);
-            std::process::exit(1);
+            // Return a default config instead of panicking
+            AppConfig {
+                app: HashMap::new(),
+                debug: DebugConfig::default(),
+            }
         }
     }
 }
@@ -282,6 +343,10 @@ fn switch_input_source(input_source_id: &str) {
                 None => ptr::null(),
             };
 
+            if source.is_null() {
+                continue; // Skip null sources safely
+            }
+
             let source_id = TISGetInputSourceProperty(
                 source as CFTypeRef,
                 CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
@@ -315,37 +380,57 @@ async fn watch_config_for_changes(
 
     let (watcher_tx, mut watcher_rx) = channel(1);
 
-    let mut watcher = RecommendedWatcher::new(
+    let mut watcher = match RecommendedWatcher::new(
         move |res: notify::Result<Event>| {
             if let Ok(Event {
                 kind: EventKind::Modify(_),
                 ..
             }) = res
             {
+                // Safe mutex locking with error handling
                 let now = Instant::now();
-                let mut last_update = last_update_time.lock().unwrap();
-
-                if now.duration_since(*last_update) > debounce_duration {
-                    *last_update = now;
-                    if watcher_tx.try_send(()).is_err() {
-                        error!("Failed to send file event update");
+                match last_update_time.lock() {
+                    Ok(mut last_update) => {
+                        if now.duration_since(*last_update) > debounce_duration {
+                            *last_update = now;
+                            if watcher_tx.try_send(()).is_err() {
+                                // This is normal when shutting down, so debug level is appropriate
+                                debug!("Failed to send file event update - channel may be closed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to lock last_update_time: {}", e);
                     }
                 }
             }
         },
         Config::default(),
-    )
-    .expect("Failed to create watcher");
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("Failed to create watcher: {}", e);
+            return; // Exit the function instead of panicking
+        }
+    };
 
-    watcher
-        .watch(Path::new(&config_path), RecursiveMode::NonRecursive)
-        .expect("Failed to watch config file");
+    match watcher.watch(Path::new(&config_path), RecursiveMode::NonRecursive) {
+        Ok(_) => info!("Started watching config file: {}", config_path),
+        Err(e) => {
+            error!("Failed to watch config file {}: {}", config_path, e);
+            return; // Exit the function instead of panicking
+        }
+    };
 
-    info!("Started watching config file: {}", config_path);
     while let Some(()) = watcher_rx.recv().await {
         debug!("Config file change detected");
-        tx.send(()).await.unwrap();
+        if let Err(e) = tx.send(()).await {
+            error!("Failed to send config reload signal: {}", e);
+            break; // Break the loop if the channel is closed
+        }
     }
+
+    debug!("Config watcher task ended");
 }
 
 fn print_available_input_sources() {
@@ -357,8 +442,12 @@ fn print_available_input_sources() {
         for i in 0..source_list.len() {
             let source = match source_list.get(i as isize) {
                 Some(item) => item.as_void_ptr() as CFTypeRef,
-                None => ptr::null(),
+                None => continue, // Skip invalid items safely
             };
+
+            if source.is_null() {
+                continue; // Skip null sources safely
+            }
 
             let source_id = TISGetInputSourceProperty(
                 source as CFTypeRef,
@@ -396,13 +485,22 @@ fn print_available_input_sources() {
                         if !input_languages.is_null() {
                             let languages: CFArray =
                                 TCFType::wrap_under_get_rule(input_languages as CFArrayRef);
-                            let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
-                                let lang_ptr: *const c_void = item.as_void_ptr();
-                                let lang_str: CFString =
-                                    TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
-                                lang_str.to_string()
-                            });
-                            lang
+
+                            if languages.len() > 0 {
+                                let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
+                                    let lang_ptr: *const c_void = item.as_void_ptr();
+                                    if !lang_ptr.is_null() {
+                                        let lang_str: CFString =
+                                            TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
+                                        lang_str.to_string()
+                                    } else {
+                                        "Unknown".to_string()
+                                    }
+                                });
+                                lang
+                            } else {
+                                "Unknown (Empty languages)".to_string()
+                            }
                         } else {
                             let input_type = TISGetInputSourceProperty(
                                 source,
@@ -428,11 +526,17 @@ fn print_available_input_sources() {
 }
 
 fn is_iswitch_running() -> bool {
-    let output = Command::new("pgrep")
+    let output = match Command::new("pgrep")
         .arg("-f") // Search full command line
         .arg("iswitch")
         .output()
-        .expect("Failed to execute pgrep");
+    {
+        Ok(o) => o,
+        Err(e) => {
+            error!("Failed to execute pgrep: {}", e);
+            return false; // Assume not running in case of error
+        }
+    };
 
     // Convert output to string and count lines to determine the number of processes
     let output_str = String::from_utf8_lossy(&output.stdout);
@@ -445,6 +549,21 @@ fn is_iswitch_running() -> bool {
 
 #[tokio::main]
 async fn main() {
+    // Set custom panic hook to prevent crashes
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("PANIC in iswitch application:");
+        if let Some(location) = panic_info.location() {
+            eprintln!(
+                "  at file '{}' line {}: {}",
+                location.file(),
+                location.line(),
+                panic_info
+            );
+        } else {
+            eprintln!("  {}", panic_info);
+        }
+    }));
+
     let args: Vec<String> = std::env::args().collect();
 
     // Handle -p option immediately with minimal output
@@ -457,9 +576,10 @@ async fn main() {
     let config_path = get_config_path();
     let config = ensure_then_load(&config_path).await;
 
-    // Set up logging system
+    // Set up logging system with proper error handling
     if let Err(e) = setup_logging(&config) {
         eprintln!("Failed to set up logging system: {}", e);
+        // Continue without proper logging
     }
 
     info!("iSwitch starting, argument count: {}", args.len());
@@ -535,44 +655,68 @@ async fn main() {
         let block = ConcreteBlock::new({
             let config = Arc::clone(&config);
             move |notification: id| {
-                let app: id = msg_send![notification, userInfo];
-                let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
-                let app_name: id = msg_send![running_app, localizedName];
-                let app_name_str: *const std::os::raw::c_char = msg_send![app_name, UTF8String];
+                // Wrap the notification handler in a catch_unwind to prevent crashes
+                if let Err(e) = std::panic::catch_unwind(|| {
+                    let app: id = msg_send![notification, userInfo];
+                    let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
+                    let app_name: id = msg_send![running_app, localizedName];
+                    let app_name_str: *const std::os::raw::c_char = msg_send![app_name, UTF8String];
 
-                let name = std::ffi::CStr::from_ptr(app_name_str)
-                    .to_string_lossy()
-                    .into_owned();
+                    // Check for null pointer before dereferencing
+                    if app_name_str.is_null() {
+                        error!("Application name is null");
+                        return;
+                    }
 
-                // Set the app context for logging
-                set_app_context(Some(name.clone()));
+                    let name = std::ffi::CStr::from_ptr(app_name_str)
+                        .to_string_lossy()
+                        .into_owned();
 
-                info!("Active application changed to: {}", name);
-
-                let config = Arc::clone(&config);
-                tokio::spawn(async move {
-                    // Set app context in the new thread too
+                    // Set the app context for logging
                     set_app_context(Some(name.clone()));
 
-                    let app_map = &config.lock().unwrap().app;
-                    if let Some(input_source) = app_map.get(&name) {
-                        let current_input_source = get_current_input_source();
-                        if !current_input_source.contains(input_source) {
-                            info!(
-                                "Switching to input source: {} for application: {}",
-                                input_source, name
-                            );
-                            switch_input_source(input_source);
-                        } else {
-                            debug!(
-                                "Already using correct input source: {}",
-                                current_input_source
-                            );
+                    info!("Active application changed to: {}", name);
+
+                    let config = Arc::clone(&config);
+                    tokio::spawn(async move {
+                        // Wrap the task body in catch_unwind to prevent crashes
+                        if let Err(e) = std::panic::catch_unwind(|| {
+                            // Set app context in the new thread too
+                            set_app_context(Some(name.clone()));
+                        }) {
+                            error!("Panic in tokio task when setting app context: {:?}", e);
                         }
-                    } else {
-                        debug!("No input source configured for application: {}", name);
-                    }
-                });
+
+                        // Lock config with error handling
+                        let app_map = match config.lock() {
+                            Ok(guard) => guard.app.clone(), // Clone to minimize lock time
+                            Err(e) => {
+                                error!("Failed to lock config: {}", e);
+                                return;
+                            }
+                        };
+
+                        if let Some(input_source) = app_map.get(&name) {
+                            let current_input_source = get_current_input_source();
+                            if !current_input_source.contains(input_source) {
+                                info!(
+                                    "Switching to input source: {} for application: {}",
+                                    input_source, name
+                                );
+                                switch_input_source(input_source);
+                            } else {
+                                debug!(
+                                    "Already using correct input source: {}",
+                                    current_input_source
+                                );
+                            }
+                        } else {
+                            debug!("No input source configured for application: {}", name);
+                        }
+                    });
+                }) {
+                    error!("Panic in notification handler: {:?}", e);
+                }
             }
         });
 
@@ -591,21 +735,32 @@ async fn main() {
             if let Ok(()) = rx.try_recv() {
                 info!("Config file change detected, reloading...");
                 let new_config = ensure_then_load(&config_path).await;
-                let mut locked_config = config.lock().unwrap();
-                if *locked_config != new_config {
-                    // If debug settings changed, reconfigure logging system
-                    if locked_config.debug != new_config.debug {
-                        info!("Debug settings changed, reconfiguring logging system");
-                        if let Err(e) = setup_logging(&new_config) {
-                            error!("Failed to reconfigure logging system: {}", e);
+
+                // Lock config with error handling
+                match config.lock() {
+                    Ok(mut locked_config) => {
+                        if *locked_config != new_config {
+                            // If debug settings changed, reconfigure logging system
+                            if locked_config.debug != new_config.debug {
+                                info!("Debug settings changed, reconfiguring logging system");
+                                if let Err(e) = setup_logging(&new_config) {
+                                    error!("Failed to reconfigure logging system: {}", e);
+                                }
+                            }
+
+                            *locked_config = new_config;
+                            info!("Configuration reloaded");
+
+                            if log::log_enabled!(log::Level::Debug) {
+                                debug!("New configuration: {:?}", *locked_config);
+                            }
+                        } else {
+                            debug!("No changes in configuration, skipping reload");
                         }
                     }
-
-                    *locked_config = new_config;
-                    info!("Configuration reloaded");
-                    debug!("New configuration: {:?}", *locked_config);
-                } else {
-                    debug!("No changes in configuration, skipping reload");
+                    Err(e) => {
+                        error!("Failed to lock config for reloading: {}", e);
+                    }
                 }
             }
 

@@ -332,6 +332,7 @@ dependencies = [
  "log",
  "notify",
  "objc",
+ "parking_lot",
  "serde",
  "tokio",
  "toml",

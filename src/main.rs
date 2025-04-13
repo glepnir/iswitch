@@ -10,13 +10,14 @@ use core_foundation::string::{CFString, CFStringRef};
 use lazy_static::lazy_static;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use objc::{class, msg_send, sel, sel_impl};
+use parking_lot::Mutex; // Using parking_lot::Mutex instead of std::sync::Mutex
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
@@ -44,40 +45,25 @@ lazy_static! {
     static ref APP_CONTEXT: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 }
 
-// Enhanced app context handling with better mutex error recovery
+// Enhanced app context handling with parking_lot::Mutex
 fn set_app_context(app_name: Option<String>) {
-    match APP_CONTEXT.lock() {
-        Ok(mut context) => *context = app_name,
-        Err(poisoned) => {
-            // Recover from poisoned mutex instead of just logging
-            let mut context = poisoned.into_inner();
-            *context = app_name;
-            warn!("Recovered from poisoned mutex in set_app_context");
-        }
-    }
+    // parking_lot::Mutex doesn't poison on panic
+    *APP_CONTEXT.lock() = app_name;
 }
 
 fn get_app_context() -> Option<String> {
-    match APP_CONTEXT.lock() {
-        Ok(context) => context.clone(),
-        Err(poisoned) => {
-            // Recover from poisoned mutex
-            let context = poisoned.into_inner();
-            let result = context.clone();
-            warn!("Recovered from poisoned mutex in get_app_context");
-            result
-        }
-    }
+    // parking_lot::Mutex doesn't poison on panic
+    APP_CONTEXT.lock().clone()
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Clone)]
 struct AppConfig {
     app: HashMap<String, String>,
     #[serde(default)]
     debug: DebugConfig,
 }
 
-#[derive(Debug, Deserialize, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Clone)]
 struct DebugConfig {
     #[serde(default)]
     enabled: bool,
@@ -123,17 +109,26 @@ fn setup_console_only_logging() -> Result<(), fern::InitError> {
     Ok(())
 }
 
-// Improved format function that uses get_app_context
+// Improved format function that is entirely panic-free
 fn log_format(out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record) {
+    // Safely get app context with a default fallback
     let app_context = get_app_context().unwrap_or_else(|| "iswitch".to_string());
-    out.finish(format_args!(
+
+    // Create timestamp string without unnecessary match
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+
+    // Format message with safe operations
+    let formatted = format!(
         "{} [{}] [{}] [{}] {}",
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        timestamp,
         record.level(),
         record.target(),
         app_context,
         message
-    ));
+    );
+
+    // Finish without any potential panic operations
+    out.finish(format_args!("{}", formatted));
 }
 
 fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
@@ -167,7 +162,6 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
         }
     }
 
-    // Configure log formatter with app context and error handling using our new format function
     // Create file with appropriate error handling
     let file_result = match fern::log_file(&log_file) {
         Ok(file) => file,
@@ -225,6 +219,12 @@ fn get_config_path() -> String {
 async fn ensure_then_load(config_path: &str) -> AppConfig {
     let path = Path::new(config_path);
 
+    // Default config as a fallback
+    let default_config = AppConfig {
+        app: HashMap::new(),
+        debug: DebugConfig::default(),
+    };
+
     // Only print config diagnostics in debug mode
     if log::log_enabled!(log::Level::Debug) {
         debug!("Config path: {}, exist: {}", config_path, path.exists());
@@ -235,15 +235,12 @@ async fn ensure_then_load(config_path: &str) -> AppConfig {
             if let Err(e) = fs::create_dir_all(parent).await {
                 error!("Failed to create config directory: {}", e);
                 // Return a default config instead of panicking
-                return AppConfig {
-                    app: HashMap::new(),
-                    debug: DebugConfig::default(),
-                };
+                return default_config;
             }
         }
 
         // Richer default configuration, including debug section
-        let default_config = r#"[app]
+        let default_config_str = r#"[app]
 # Examples of application-to-input-source mappings
 # Format: "Application Name" = "InputSourceID"
 # 
@@ -258,13 +255,10 @@ level = "info"
 # Log file path
 file = "~/Library/Logs/iswitch.log"
 "#;
-        if let Err(e) = fs::write(path, default_config).await {
+        if let Err(e) = fs::write(path, default_config_str).await {
             error!("Failed to write default config file: {}", e);
             // Return a default config instead of panicking
-            return AppConfig {
-                app: HashMap::new(),
-                debug: DebugConfig::default(),
-            };
+            return default_config;
         }
         info!("Created default config file at: {}", config_path);
     }
@@ -297,20 +291,14 @@ file = "~/Library/Logs/iswitch.log"
                     error!("Failed to parse config file: {}", e);
                     error!("Config content: {}", config_content);
                     // Return a default config instead of panicking
-                    AppConfig {
-                        app: HashMap::new(),
-                        debug: DebugConfig::default(),
-                    }
+                    default_config
                 }
             }
         }
         Err(e) => {
             error!("Unable to read config file: {}", e);
             // Return a default config instead of panicking
-            AppConfig {
-                app: HashMap::new(),
-                debug: DebugConfig::default(),
-            }
+            default_config
         }
     }
 }
@@ -409,28 +397,14 @@ async fn watch_config_for_changes(
                 ..
             }) = res
             {
-                // Safe mutex locking with error handling
+                // parking_lot::Mutex doesn't poison on panic
                 let now = Instant::now();
-                match last_update_time.lock() {
-                    Ok(mut last_update) => {
-                        if now.duration_since(*last_update) > debounce_duration {
-                            *last_update = now;
-                            if watcher_tx.try_send(()).is_err() {
-                                // This is normal when shutting down, so debug level is appropriate
-                                debug!("Failed to send file event update - channel may be closed");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Recover from poisoned mutex
-                        let mut last_update = e.into_inner();
-                        if now.duration_since(*last_update) > debounce_duration {
-                            *last_update = now;
-                            if watcher_tx.try_send(()).is_err() {
-                                debug!("Failed to send file event update - channel may be closed");
-                            }
-                        }
-                        warn!("Recovered from poisoned mutex in file watcher");
+                let mut last_update = last_update_time.lock();
+                if now.duration_since(*last_update) > debounce_duration {
+                    *last_update = now;
+                    if watcher_tx.try_send(()).is_err() {
+                        // This is normal when shutting down, so debug level is appropriate
+                        debug!("Failed to send file event update - channel may be closed");
                     }
                 }
             }
@@ -586,9 +560,27 @@ fn is_iswitch_running() -> bool {
     process_count > 1
 }
 
-#[tokio::main]
+// Add a helper function to safely get NSString values
+unsafe fn safe_get_nsstring(obj: id) -> Option<String> {
+    if obj.is_null() {
+        return None;
+    }
+
+    let utf8_str: *const std::os::raw::c_char = msg_send![obj, UTF8String];
+    if utf8_str.is_null() {
+        return None;
+    }
+
+    Some(
+        std::ffi::CStr::from_ptr(utf8_str)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Set custom panic hook to prevent crashes
+    // Set custom panic hook to log but not crash
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("PANIC in iswitch application:");
         if let Some(location) = panic_info.location() {
@@ -601,6 +593,7 @@ async fn main() {
         } else {
             eprintln!("  {}", panic_info);
         }
+        // Log the panic but don't abort
     }));
 
     // Set initial app context
@@ -715,118 +708,69 @@ async fn main() {
         let block = ConcreteBlock::new({
             let config = Arc::clone(&config);
             move |notification: id| {
-                // Wrap the notification handler in a catch_unwind to prevent crashes
-                if let Err(e) = std::panic::catch_unwind(|| {
-                    if notification.is_null() {
-                        error!("Received null notification");
+                // Process notifications with proper error handling but without catch_unwind
+                // since we can't safely transfer config across unwind boundary
+                if notification.is_null() {
+                    error!("Received null notification");
+                    return;
+                }
+
+                let app: id = msg_send![notification, userInfo];
+
+                if app.is_null() {
+                    error!("Notification userInfo is null");
+                    return;
+                }
+
+                let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
+
+                if running_app.is_null() {
+                    error!("Running application is null");
+                    return;
+                }
+
+                // Use the safe helper to get application name
+                let name = match safe_get_nsstring(msg_send![running_app, localizedName]) {
+                    Some(name) => name,
+                    None => {
+                        error!("Failed to get application name");
                         return;
                     }
+                };
 
-                    let app: id = msg_send![notification, userInfo];
+                // Set the app context for logging
+                set_app_context(Some(name.clone()));
 
-                    if app.is_null() {
-                        error!("Notification userInfo is null");
-                        return;
-                    }
+                info!("Active application changed to: {}", name);
 
-                    let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
+                // Use a scoped copy of the config to minimize lock time
+                let app_map = config.lock().app.clone();
 
-                    if running_app.is_null() {
-                        error!("Running application is null");
-                        return;
-                    }
+                if let Some(input_source) = app_map.get(&name) {
+                    let current_input_source = get_current_input_source();
+                    if !current_input_source.contains(input_source) {
+                        info!(
+                            "Switching to input source: {} for application: {}",
+                            input_source, name
+                        );
 
-                    let app_name: id = msg_send![running_app, localizedName];
+                        // Use a local, owned copy to avoid RefUnwindSafe issues
+                        let input_source_owned = input_source.clone();
 
-                    if app_name.is_null() {
-                        error!("Application name is null");
-                        return;
-                    }
-
-                    let app_name_str: *const std::os::raw::c_char = msg_send![app_name, UTF8String];
-
-                    // Check for null pointer before dereferencing
-                    if app_name_str.is_null() {
-                        error!("Application name string is null");
-                        return;
-                    }
-
-                    let name = std::ffi::CStr::from_ptr(app_name_str)
-                        .to_string_lossy()
-                        .into_owned();
-
-                    // Set the app context for logging
-                    set_app_context(Some(name.clone()));
-
-                    info!("Active application changed to: {}", name);
-
-                    // Use a scoped copy of the config to minimize lock time
-                    let app_map = match config.try_lock() {
-                        Ok(guard) => guard.app.clone(),
-                        Err(e) => {
-                            match e {
-                                std::sync::TryLockError::WouldBlock => {
-                                    debug!(
-                                        "Config mutex is locked, skipping this app change event"
-                                    );
-                                }
-                                std::sync::TryLockError::Poisoned(poison_err) => {
-                                    let guard = poison_err.into_inner();
-                                    warn!("Recovered from poisoned config mutex");
-                                    // Add semicolon here to make it a statement instead of an expression
-                                    let recovered_map = guard.app.clone();
-
-                                    if let Some(input_source) = recovered_map.get(&name) {
-                                        let current_input_source = get_current_input_source();
-                                        if !current_input_source.contains(input_source) {
-                                            info!(
-                                                "Switching to input source: {} for application: {} (after mutex recovery)",
-                                                input_source, name
-                                            );
-
-                                            // Wrap the potentially panicking function in catch_unwind
-                                            if let Err(e) = std::panic::catch_unwind(|| {
-                                                switch_input_source(input_source);
-                                            }) {
-                                                error!(
-                                                    "Panic when switching input source: {:?}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
-                                    return;
-                                }
-                            }
-                            return;
-                        }
-                    };
-
-                    if let Some(input_source) = app_map.get(&name) {
-                        let current_input_source = get_current_input_source();
-                        if !current_input_source.contains(input_source) {
-                            info!(
-                                "Switching to input source: {} for application: {}",
-                                input_source, name
-                            );
-
-                            // Wrap the potentially panicking function in catch_unwind
-                            if let Err(e) = std::panic::catch_unwind(|| {
-                                switch_input_source(input_source);
-                            }) {
-                                error!("Panic when switching input source: {:?}", e);
-                            }
-                        } else {
-                            debug!(
-                                "Already using correct input source: {}",
-                                current_input_source
-                            );
+                        // Wrap the potentially panicking function in catch_unwind
+                        if let Err(e) = std::panic::catch_unwind(move || {
+                            switch_input_source(&input_source_owned);
+                        }) {
+                            error!("Panic when switching input source: {:?}", e);
                         }
                     } else {
-                        debug!("No input source configured for application: {}", name);
+                        debug!(
+                            "Already using correct input source: {}",
+                            current_input_source
+                        );
                     }
-                }) {
-                    error!("Panic in notification handler: {:?}", e);
+                } else {
+                    debug!("No input source configured for application: {}", name);
                 }
             }
         });
@@ -850,6 +794,7 @@ async fn main() {
             usingBlock: block
         ];
 
+        // Main run loop with safe error handling
         loop {
             // Handle config file changes
             if let Ok(()) = rx.try_recv() {
@@ -858,54 +803,26 @@ async fn main() {
                 // Load new config outside the mutex lock
                 let new_config = ensure_then_load(&config_path).await;
 
-                // Lock config with error handling
-                match config.try_lock() {
-                    Ok(mut locked_config) => {
-                        if *locked_config != new_config {
-                            // If debug settings changed, reconfigure logging system
-                            if locked_config.debug != new_config.debug {
-                                info!("Debug settings changed, reconfiguring logging system");
-                                if let Err(e) = setup_logging(&new_config) {
-                                    error!("Failed to reconfigure logging system: {}", e);
-                                }
-                            }
+                // Get a mutex lock and update config
+                let mut current_config = config.lock();
 
-                            *locked_config = new_config;
-                            info!("Configuration reloaded");
-
-                            if log::log_enabled!(log::Level::Debug) {
-                                debug!("New configuration: {:?}", *locked_config);
-                            }
-                        } else {
-                            debug!("No changes in configuration, skipping reload");
+                if *current_config != new_config {
+                    // If debug settings changed, reconfigure logging system
+                    if current_config.debug != new_config.debug {
+                        info!("Debug settings changed, reconfiguring logging system");
+                        if let Err(e) = setup_logging(&new_config) {
+                            error!("Failed to reconfigure logging system: {}", e);
                         }
                     }
-                    Err(e) => {
-                        match e {
-                            std::sync::TryLockError::WouldBlock => {
-                                warn!("Config mutex is locked, will try to reload later");
-                            }
-                            std::sync::TryLockError::Poisoned(poison_err) => {
-                                let mut locked_config = poison_err.into_inner();
-                                warn!("Recovered from poisoned mutex during config reload");
 
-                                if *locked_config != new_config {
-                                    // If debug settings changed, reconfigure logging system
-                                    if locked_config.debug != new_config.debug {
-                                        info!(
-                                            "Debug settings changed, reconfiguring logging system"
-                                        );
-                                        if let Err(e) = setup_logging(&new_config) {
-                                            error!("Failed to reconfigure logging system: {}", e);
-                                        }
-                                    }
+                    *current_config = new_config;
+                    info!("Configuration reloaded");
 
-                                    *locked_config = new_config;
-                                    info!("Configuration reloaded after mutex recovery");
-                                }
-                            }
-                        }
+                    if log::log_enabled!(log::Level::Debug) {
+                        debug!("New configuration: {:?}", *current_config);
                     }
+                } else {
+                    debug!("No changes in configuration, skipping reload");
                 }
             }
 

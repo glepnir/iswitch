@@ -44,22 +44,28 @@ lazy_static! {
     static ref APP_CONTEXT: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 }
 
+// Enhanced app context handling with better mutex error recovery
 fn set_app_context(app_name: Option<String>) {
-    if let Ok(mut context) = APP_CONTEXT.lock() {
-        *context = app_name;
-    } else {
-        // Handle potential poisoned mutex to avoid panics
-        eprintln!("Warning: Failed to set app context - mutex was poisoned");
+    match APP_CONTEXT.lock() {
+        Ok(mut context) => *context = app_name,
+        Err(poisoned) => {
+            // Recover from poisoned mutex instead of just logging
+            let mut context = poisoned.into_inner();
+            *context = app_name;
+            warn!("Recovered from poisoned mutex in set_app_context");
+        }
     }
 }
 
 fn get_app_context() -> Option<String> {
     match APP_CONTEXT.lock() {
         Ok(context) => context.clone(),
-        Err(_) => {
-            // Handle potential poisoned mutex to avoid panics
-            eprintln!("Warning: Failed to get app context - mutex was poisoned");
-            Some("iswitch".to_string()) // Fallback to default
+        Err(poisoned) => {
+            // Recover from poisoned mutex
+            let context = poisoned.into_inner();
+            let result = context.clone();
+            warn!("Recovered from poisoned mutex in get_app_context");
+            result
         }
     }
 }
@@ -117,6 +123,19 @@ fn setup_console_only_logging() -> Result<(), fern::InitError> {
     Ok(())
 }
 
+// Improved format function that uses get_app_context
+fn log_format(out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record) {
+    let app_context = get_app_context().unwrap_or_else(|| "iswitch".to_string());
+    out.finish(format_args!(
+        "{} [{}] [{}] [{}] {}",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        record.level(),
+        record.target(),
+        app_context,
+        message
+    ));
+}
+
 fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
     if !config.debug.enabled {
         // If debugging is not enabled, only configure basic console logging
@@ -148,20 +167,7 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
         }
     }
 
-    // Configure log formatter with app context and error handling
-    let format_fn =
-        |out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record| {
-            let app_context = get_app_context().unwrap_or_else(|| "iswitch".to_string());
-            out.finish(format_args!(
-                "{} [{}] [{}] [{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                record.level(),
-                record.target(),
-                app_context,
-                message
-            ))
-        };
-
+    // Configure log formatter with app context and error handling using our new format function
     // Create file with appropriate error handling
     let file_result = match fern::log_file(&log_file) {
         Ok(file) => file,
@@ -173,12 +179,12 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
 
     // Configure log dispatcher
     let dispatch = fern::Dispatch::new()
-        .format(format_fn)
+        .format(log_format)
         .level(log_level)
         .chain(std::io::stdout()); // Always output to console
 
     // Add file output with the same format
-    let file_config = fern::Dispatch::new().format(format_fn).chain(file_result);
+    let file_config = fern::Dispatch::new().format(log_format).chain(file_result);
 
     // Merge dispatchers and apply
     match dispatch.chain(file_config).apply() {
@@ -309,30 +315,44 @@ file = "~/Library/Logs/iswitch.log"
     }
 }
 
+// Improved function with better error handling
 fn get_current_input_source() -> String {
     unsafe {
         let current_source = TISCopyCurrentKeyboardInputSource();
-        if !current_source.is_null() {
-            let source_name = TISGetInputSourceProperty(
-                current_source,
-                CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
-            );
-            if !source_name.is_null() {
-                let cf_str: CFString = TCFType::wrap_under_get_rule(source_name as CFStringRef);
-                let source_id = cf_str.to_string();
-                debug!("Current input source ID: {}", source_id);
-                return source_id;
-            }
+        if current_source.is_null() {
+            warn!("Current input source is null");
+            return String::from("Unknown");
         }
-        String::from("Unknown")
+
+        let source_name = TISGetInputSourceProperty(
+            current_source,
+            CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
+        );
+
+        if source_name.is_null() {
+            warn!("Source name property is null");
+            return String::from("Unknown");
+        }
+
+        let cf_str: CFString = TCFType::wrap_under_get_rule(source_name as CFStringRef);
+        let source_id = cf_str.to_string();
+        debug!("Current input source ID: {}", source_id);
+        source_id
     }
 }
 
 fn switch_input_source(input_source_id: &str) {
     let input_source_cfstring = CFString::new(input_source_id);
+
     unsafe {
-        let source_list: CFArray =
-            TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
+        let source_list_ref = TISCreateInputSourceList(ptr::null(), 0);
+
+        if source_list_ref.is_null() {
+            error!("Failed to get input source list");
+            return;
+        }
+
+        let source_list: CFArray = TCFType::wrap_under_get_rule(source_list_ref);
 
         info!("Attempting to switch to input source: {}", input_source_id);
 
@@ -340,28 +360,30 @@ fn switch_input_source(input_source_id: &str) {
         for i in 0..source_list.len() {
             let source = match source_list.get(i as isize) {
                 Some(item) => item.as_void_ptr() as CFTypeRef,
-                None => ptr::null(),
+                None => continue, // Skip invalid entries safely
             };
 
             if source.is_null() {
                 continue; // Skip null sources safely
             }
 
-            let source_id = TISGetInputSourceProperty(
+            let source_id_ptr = TISGetInputSourceProperty(
                 source as CFTypeRef,
                 CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
             );
 
-            if !source_id.is_null() {
-                let source_cfstring: CFString =
-                    TCFType::wrap_under_get_rule(source_id as CFStringRef);
+            if source_id_ptr.is_null() {
+                continue; // Skip entries with null properties
+            }
 
-                if source_cfstring == input_source_cfstring {
-                    info!("Found matching input source, switching...");
-                    TISSelectInputSource(source);
-                    found = true;
-                    break;
-                }
+            let source_cfstring: CFString =
+                TCFType::wrap_under_get_rule(source_id_ptr as CFStringRef);
+
+            if source_cfstring == input_source_cfstring {
+                info!("Found matching input source, switching...");
+                TISSelectInputSource(source);
+                found = true;
+                break;
             }
         }
 
@@ -400,7 +422,15 @@ async fn watch_config_for_changes(
                         }
                     }
                     Err(e) => {
-                        error!("Failed to lock last_update_time: {}", e);
+                        // Recover from poisoned mutex
+                        let mut last_update = e.into_inner();
+                        if now.duration_since(*last_update) > debounce_duration {
+                            *last_update = now;
+                            if watcher_tx.try_send(()).is_err() {
+                                debug!("Failed to send file event update - channel may be closed");
+                            }
+                        }
+                        warn!("Recovered from poisoned mutex in file watcher");
                     }
                 }
             }
@@ -435,8 +465,14 @@ async fn watch_config_for_changes(
 
 fn print_available_input_sources() {
     unsafe {
-        let source_list: CFArray =
-            TCFType::wrap_under_get_rule(TISCreateInputSourceList(ptr::null(), 0));
+        let source_list_ref = TISCreateInputSourceList(ptr::null(), 0);
+
+        if source_list_ref.is_null() {
+            println!("Failed to get input source list");
+            return;
+        }
+
+        let source_list: CFArray = TCFType::wrap_under_get_rule(source_list_ref);
 
         println!("Available input sources:");
         for i in 0..source_list.len() {
@@ -449,78 +485,81 @@ fn print_available_input_sources() {
                 continue; // Skip null sources safely
             }
 
-            let source_id = TISGetInputSourceProperty(
+            let source_id_ptr = TISGetInputSourceProperty(
                 source as CFTypeRef,
                 CFString::new(K_TIS_PROPERTY_INPUT_SOURCE_ID).as_concrete_TypeRef(),
             );
 
-            if !source_id.is_null() {
-                let source_cfstring: CFString =
-                    TCFType::wrap_under_get_rule(source_id as CFStringRef);
+            if source_id_ptr.is_null() {
+                continue; // Skip entries with null id properties
+            }
 
-                let localized_name = TISGetInputSourceProperty(
+            let source_cfstring: CFString =
+                TCFType::wrap_under_get_rule(source_id_ptr as CFStringRef);
+
+            let localized_name_ptr = TISGetInputSourceProperty(
+                source,
+                CFString::new("TISPropertyLocalizedName").as_concrete_TypeRef(),
+            );
+
+            let localized_name_str = if !localized_name_ptr.is_null() {
+                let localized_cfstring: CFString =
+                    TCFType::wrap_under_get_rule(localized_name_ptr as CFStringRef);
+                localized_cfstring.to_string()
+            } else {
+                let input_mode_id_ptr = TISGetInputSourceProperty(
                     source,
-                    CFString::new("TISPropertyLocalizedName").as_concrete_TypeRef(),
+                    CFString::new("TISPropertyInputModeID").as_concrete_TypeRef(),
                 );
-                let localized_name_str = if !localized_name.is_null() {
-                    let localized_cfstring: CFString =
-                        TCFType::wrap_under_get_rule(localized_name as CFStringRef);
-                    localized_cfstring.to_string()
+
+                if !input_mode_id_ptr.is_null() {
+                    let input_mode_cfstring: CFString =
+                        TCFType::wrap_under_get_rule(input_mode_id_ptr as CFStringRef);
+                    input_mode_cfstring.to_string()
                 } else {
-                    let input_mode_id = TISGetInputSourceProperty(
+                    let input_languages_ptr = TISGetInputSourceProperty(
                         source,
-                        CFString::new("TISPropertyInputModeID").as_concrete_TypeRef(),
+                        CFString::new("TISPropertyInputSourceLanguages").as_concrete_TypeRef(),
                     );
 
-                    if !input_mode_id.is_null() {
-                        let input_mode_cfstring: CFString =
-                            TCFType::wrap_under_get_rule(input_mode_id as CFStringRef);
-                        input_mode_cfstring.to_string()
+                    if !input_languages_ptr.is_null() {
+                        let languages: CFArray =
+                            TCFType::wrap_under_get_rule(input_languages_ptr as CFArrayRef);
+
+                        if languages.len() > 0 {
+                            let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
+                                let lang_ptr: *const c_void = item.as_void_ptr();
+                                if !lang_ptr.is_null() {
+                                    let lang_str: CFString =
+                                        TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
+                                    lang_str.to_string()
+                                } else {
+                                    "Unknown".to_string()
+                                }
+                            });
+                            lang
+                        } else {
+                            "Unknown (Empty languages)".to_string()
+                        }
                     } else {
-                        let input_languages = TISGetInputSourceProperty(
+                        let input_type_ptr = TISGetInputSourceProperty(
                             source,
-                            CFString::new("TISPropertyInputSourceLanguages").as_concrete_TypeRef(),
+                            CFString::new("TISPropertyInputSourceType").as_concrete_TypeRef(),
                         );
 
-                        if !input_languages.is_null() {
-                            let languages: CFArray =
-                                TCFType::wrap_under_get_rule(input_languages as CFArrayRef);
-
-                            if languages.len() > 0 {
-                                let lang = languages.get(0).map_or("Unknown".to_string(), |item| {
-                                    let lang_ptr: *const c_void = item.as_void_ptr();
-                                    if !lang_ptr.is_null() {
-                                        let lang_str: CFString =
-                                            TCFType::wrap_under_get_rule(lang_ptr as CFStringRef);
-                                        lang_str.to_string()
-                                    } else {
-                                        "Unknown".to_string()
-                                    }
-                                });
-                                lang
-                            } else {
-                                "Unknown (Empty languages)".to_string()
-                            }
+                        if !input_type_ptr.is_null() {
+                            let input_type_cfstring: CFString =
+                                TCFType::wrap_under_get_rule(input_type_ptr as CFStringRef);
+                            format!("Unknown ({})", input_type_cfstring.to_string())
                         } else {
-                            let input_type = TISGetInputSourceProperty(
-                                source,
-                                CFString::new("TISPropertyInputSourceType").as_concrete_TypeRef(),
-                            );
-
-                            if !input_type.is_null() {
-                                let input_type_cfstring: CFString =
-                                    TCFType::wrap_under_get_rule(input_type as CFStringRef);
-                                format!("Unknown ({})", input_type_cfstring.to_string())
-                            } else {
-                                debug!("Localized name is null for source: {}", source_cfstring);
-                                "Unknown".to_string()
-                            }
+                            debug!("Localized name is null for source: {}", source_cfstring);
+                            "Unknown".to_string()
                         }
                     }
-                };
+                }
+            };
 
-                println!("{} - {}", source_cfstring, localized_name_str);
-            }
+            println!("{} - {}", source_cfstring, localized_name_str);
         }
     }
 }
@@ -564,6 +603,9 @@ async fn main() {
         }
     }));
 
+    // Set initial app context
+    set_app_context(Some("iswitch".to_string()));
+
     let args: Vec<String> = std::env::args().collect();
 
     // Handle -p option immediately with minimal output
@@ -590,6 +632,7 @@ async fn main() {
                 if args.len() > 2 {
                     let desired_input_source = &args[2];
                     let current_input_source = get_current_input_source();
+
                     info!(
                         "Current input source: {}, Target input source: {}",
                         current_input_source, desired_input_source
@@ -600,7 +643,13 @@ async fn main() {
                             "Switching input source from {} to {}",
                             current_input_source, desired_input_source
                         );
-                        switch_input_source(desired_input_source);
+
+                        // Wrap the potentially panicking function in catch_unwind
+                        if let Err(e) = std::panic::catch_unwind(|| {
+                            switch_input_source(desired_input_source);
+                        }) {
+                            error!("Panic when switching input source: {:?}", e);
+                        }
                     }
 
                     // Check if another instance is already running
@@ -650,21 +699,55 @@ async fn main() {
         // Objc related code
         debug!("Initializing NSWorkspace");
         let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+
+        if workspace.is_null() {
+            error!("Failed to get shared workspace");
+            return;
+        }
+
         let notification_center: id = msg_send![workspace, notificationCenter];
+
+        if notification_center.is_null() {
+            error!("Failed to get notification center");
+            return;
+        }
 
         let block = ConcreteBlock::new({
             let config = Arc::clone(&config);
             move |notification: id| {
                 // Wrap the notification handler in a catch_unwind to prevent crashes
                 if let Err(e) = std::panic::catch_unwind(|| {
+                    if notification.is_null() {
+                        error!("Received null notification");
+                        return;
+                    }
+
                     let app: id = msg_send![notification, userInfo];
+
+                    if app.is_null() {
+                        error!("Notification userInfo is null");
+                        return;
+                    }
+
                     let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
+
+                    if running_app.is_null() {
+                        error!("Running application is null");
+                        return;
+                    }
+
                     let app_name: id = msg_send![running_app, localizedName];
+
+                    if app_name.is_null() {
+                        error!("Application name is null");
+                        return;
+                    }
+
                     let app_name_str: *const std::os::raw::c_char = msg_send![app_name, UTF8String];
 
                     // Check for null pointer before dereferencing
                     if app_name_str.is_null() {
-                        error!("Application name is null");
+                        error!("Application name string is null");
                         return;
                     }
 
@@ -677,43 +760,71 @@ async fn main() {
 
                     info!("Active application changed to: {}", name);
 
-                    let config = Arc::clone(&config);
-                    tokio::spawn(async move {
-                        // Wrap the task body in catch_unwind to prevent crashes
-                        if let Err(e) = std::panic::catch_unwind(|| {
-                            // Set app context in the new thread too
-                            set_app_context(Some(name.clone()));
-                        }) {
-                            error!("Panic in tokio task when setting app context: {:?}", e);
-                        }
+                    // Use a scoped copy of the config to minimize lock time
+                    let app_map = match config.try_lock() {
+                        Ok(guard) => guard.app.clone(),
+                        Err(e) => {
+                            match e {
+                                std::sync::TryLockError::WouldBlock => {
+                                    debug!(
+                                        "Config mutex is locked, skipping this app change event"
+                                    );
+                                }
+                                std::sync::TryLockError::Poisoned(poison_err) => {
+                                    let guard = poison_err.into_inner();
+                                    warn!("Recovered from poisoned config mutex");
+                                    // Add semicolon here to make it a statement instead of an expression
+                                    let recovered_map = guard.app.clone();
 
-                        // Lock config with error handling
-                        let app_map = match config.lock() {
-                            Ok(guard) => guard.app.clone(), // Clone to minimize lock time
-                            Err(e) => {
-                                error!("Failed to lock config: {}", e);
-                                return;
+                                    if let Some(input_source) = recovered_map.get(&name) {
+                                        let current_input_source = get_current_input_source();
+                                        if !current_input_source.contains(input_source) {
+                                            info!(
+                                                "Switching to input source: {} for application: {} (after mutex recovery)",
+                                                input_source, name
+                                            );
+
+                                            // Wrap the potentially panicking function in catch_unwind
+                                            if let Err(e) = std::panic::catch_unwind(|| {
+                                                switch_input_source(input_source);
+                                            }) {
+                                                error!(
+                                                    "Panic when switching input source: {:?}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
                             }
-                        };
+                            return;
+                        }
+                    };
 
-                        if let Some(input_source) = app_map.get(&name) {
-                            let current_input_source = get_current_input_source();
-                            if !current_input_source.contains(input_source) {
-                                info!(
-                                    "Switching to input source: {} for application: {}",
-                                    input_source, name
-                                );
+                    if let Some(input_source) = app_map.get(&name) {
+                        let current_input_source = get_current_input_source();
+                        if !current_input_source.contains(input_source) {
+                            info!(
+                                "Switching to input source: {} for application: {}",
+                                input_source, name
+                            );
+
+                            // Wrap the potentially panicking function in catch_unwind
+                            if let Err(e) = std::panic::catch_unwind(|| {
                                 switch_input_source(input_source);
-                            } else {
-                                debug!(
-                                    "Already using correct input source: {}",
-                                    current_input_source
-                                );
+                            }) {
+                                error!("Panic when switching input source: {:?}", e);
                             }
                         } else {
-                            debug!("No input source configured for application: {}", name);
+                            debug!(
+                                "Already using correct input source: {}",
+                                current_input_source
+                            );
                         }
-                    });
+                    } else {
+                        debug!("No input source configured for application: {}", name);
+                    }
                 }) {
                     error!("Panic in notification handler: {:?}", e);
                 }
@@ -723,21 +834,32 @@ async fn main() {
         let block = &*block.copy();
 
         info!("Setting up application switch notification observer");
+
+        let notification_name =
+            NSString::alloc(nil).init_str("NSWorkspaceDidActivateApplicationNotification");
+        if notification_name.is_null() {
+            error!("Failed to create notification name string");
+            return;
+        }
+
         let _: id = msg_send![
             notification_center,
-            addObserverForName: NSString::alloc(nil).init_str("NSWorkspaceDidActivateApplicationNotification")
+            addObserverForName: notification_name
             object: nil
             queue: nil
             usingBlock: block
         ];
 
         loop {
+            // Handle config file changes
             if let Ok(()) = rx.try_recv() {
                 info!("Config file change detected, reloading...");
+
+                // Load new config outside the mutex lock
                 let new_config = ensure_then_load(&config_path).await;
 
                 // Lock config with error handling
-                match config.lock() {
+                match config.try_lock() {
                     Ok(mut locked_config) => {
                         if *locked_config != new_config {
                             // If debug settings changed, reconfigure logging system
@@ -759,16 +881,51 @@ async fn main() {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to lock config for reloading: {}", e);
+                        match e {
+                            std::sync::TryLockError::WouldBlock => {
+                                warn!("Config mutex is locked, will try to reload later");
+                            }
+                            std::sync::TryLockError::Poisoned(poison_err) => {
+                                let mut locked_config = poison_err.into_inner();
+                                warn!("Recovered from poisoned mutex during config reload");
+
+                                if *locked_config != new_config {
+                                    // If debug settings changed, reconfigure logging system
+                                    if locked_config.debug != new_config.debug {
+                                        info!(
+                                            "Debug settings changed, reconfiguring logging system"
+                                        );
+                                        if let Err(e) = setup_logging(&new_config) {
+                                            error!("Failed to reconfigure logging system: {}", e);
+                                        }
+                                    }
+
+                                    *locked_config = new_config;
+                                    info!("Configuration reloaded after mutex recovery");
+                                }
+                            }
+                        }
                     }
                 }
             }
 
-            CFRunLoopRunInMode(
+            // Run one iteration of the main event loop with proper error handling
+            let run_result = CFRunLoopRunInMode(
                 CFString::new(K_CF_RUN_LOOP_DEFAULT_MODE).as_concrete_TypeRef(),
                 0.5,
                 false as u8,
             );
+
+            // Check for run loop errors
+            if run_result == 0 {
+                // This is normal, just continue
+            } else if run_result == 1 {
+                // Run loop was stopped by another thread, which is usually not expected
+                warn!("Run loop was stopped by another thread");
+            } else {
+                // Other errors, log with debug level as this is usually harmless
+                debug!("Run loop returned unexpected code: {}", run_result);
+            }
         }
     }
 }

@@ -98,39 +98,59 @@ fn default_log_file() -> String {
     }
 }
 
-// Setup console-only logging as a fallback in case of errors
-fn setup_console_only_logging() -> Result<(), fern::InitError> {
-    fern::Dispatch::new()
-        .level(log::LevelFilter::Info)
-        .chain(std::io::stdout())
-        .apply()?;
-
-    eprintln!("Initialized console-only logging due to file logging setup failure");
-    Ok(())
-}
-
-// Improved format function that is entirely panic-free
 fn log_format(out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record) {
-    // Safely get app context with a default fallback
-    let app_context = get_app_context().unwrap_or_else(|| "iswitch".to_string());
+    // Safely get app context with a default fallback, without any unwrap
+    let app_context = match get_app_context() {
+        Some(ctx) => ctx,
+        None => "iswitch".to_string(),
+    };
 
-    // Create timestamp string without unnecessary match
+    // Create timestamp string with safe formatting
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // Format message with safe operations
-    let formatted = format!(
+    // Use format_args! directly instead of format! to avoid allocation failures
+    let _ = out.finish(format_args!(
         "{} [{}] [{}] [{}] {}",
         timestamp,
         record.level(),
         record.target(),
         app_context,
         message
-    );
-
-    // Finish without any potential panic operations
-    out.finish(format_args!("{}", formatted));
+    ));
 }
 
+// Improved console-only logging setup function
+fn setup_console_only_logging() -> Result<(), fern::InitError> {
+    // Use a simpler format function for fallback logging
+    let fallback_format =
+        |out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record| {
+            let _ = out.finish(format_args!(
+                "[{}] [{}] {}",
+                record.level(),
+                record.target(),
+                message
+            ));
+        };
+
+    match fern::Dispatch::new()
+        .format(fallback_format)
+        .level(log::LevelFilter::Info)
+        .chain(std::io::stdout())
+        .apply()
+    {
+        Ok(_) => {
+            eprintln!("Initialized console-only logging");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize console logging: {}", e);
+            // Convert SetLoggerError to InitError
+            Err(fern::InitError::SetLoggerError(e))
+        }
+    }
+}
+
+// Fixed setup_logging function with proper error handling
 fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
     if !config.debug.enabled {
         // If debugging is not enabled, only configure basic console logging
@@ -148,10 +168,10 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
     };
 
     // Ensure log file directory exists with proper error handling
-    let log_file = config
-        .debug
-        .file
-        .replace("~", &std::env::var("HOME").unwrap_or_default());
+    let log_file = match std::env::var("HOME") {
+        Ok(home) => config.debug.file.replace("~", &home),
+        Err(_) => config.debug.file.clone(), // Keep as is if HOME not available
+    };
 
     if let Some(parent) = Path::new(&log_file).parent() {
         if !parent.exists() {
@@ -162,36 +182,50 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
         }
     }
 
-    // Create file with appropriate error handling
-    let file_result = match fern::log_file(&log_file) {
-        Ok(file) => file,
+    // Create dispatch with safe error handling for both stdout and file
+    let dispatch = fern::Dispatch::new().format(log_format).level(log_level);
+
+    // First try to set up stdout logging, this should rarely fail
+    let stdout_dispatch = dispatch.chain(std::io::stdout());
+
+    // Then try to set up file logging, but don't fail if it doesn't work
+    match fern::log_file(&log_file) {
+        Ok(file) => {
+            match stdout_dispatch.chain(file).apply() {
+                Ok(_) => {
+                    // Try to log initialization but don't rely on it
+                    match std::panic::catch_unwind(|| {
+                        info!(
+                            "Log system initialized, level: {}, log file: {}",
+                            config.debug.level, log_file
+                        );
+                    }) {
+                        Err(_) => eprintln!("Warning: Failed to log initialization message"),
+                        _ => {}
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to setup combined logging: {}", e);
+                    // Convert SetLoggerError to InitError
+                    Err(fern::InitError::SetLoggerError(e))
+                }
+            }
+        }
         Err(e) => {
             eprintln!("Failed to open log file {}: {}", log_file, e);
-            return setup_console_only_logging();
-        }
-    };
-
-    // Configure log dispatcher
-    let dispatch = fern::Dispatch::new()
-        .format(log_format)
-        .level(log_level)
-        .chain(std::io::stdout()); // Always output to console
-
-    // Add file output with the same format
-    let file_config = fern::Dispatch::new().format(log_format).chain(file_result);
-
-    // Merge dispatchers and apply
-    match dispatch.chain(file_config).apply() {
-        Ok(_) => {
-            info!(
-                "Log system initialized, level: {}, log file: {}",
-                config.debug.level, log_file
-            );
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("Failed to initialize logging system: {}", e);
-            setup_console_only_logging()
+            // Just use stdout logging as fallback
+            match stdout_dispatch.apply() {
+                Ok(_) => {
+                    eprintln!("Falling back to console-only logging");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize console logging: {}", e);
+                    // Convert SetLoggerError to InitError
+                    Err(fern::InitError::SetLoggerError(e))
+                }
+            }
         }
     }
 }
@@ -705,76 +739,91 @@ async fn main() {
             return;
         }
 
+        // Properly structured notification handler block without catch_unwind for config access
         let block = ConcreteBlock::new({
             let config = Arc::clone(&config);
             move |notification: id| {
-                // Process notifications with proper error handling but without catch_unwind
-                // since we can't safely transfer config across unwind boundary
+                // Process notifications with proper error handling
                 if notification.is_null() {
-                    error!("Received null notification");
+                    // Use eprintln for critical errors that might happen during logging failure
+                    eprintln!("Received null notification");
                     return;
                 }
 
                 let app: id = msg_send![notification, userInfo];
-
                 if app.is_null() {
-                    error!("Notification userInfo is null");
+                    eprintln!("Notification userInfo is null");
                     return;
                 }
 
                 let running_app: id = msg_send![app, objectForKey: NSString::alloc(nil).init_str("NSWorkspaceApplicationKey")];
-
                 if running_app.is_null() {
-                    error!("Running application is null");
+                    eprintln!("Running application is null");
                     return;
                 }
 
                 // Use the safe helper to get application name
-                let name = match safe_get_nsstring(msg_send![running_app, localizedName]) {
+                let app_name = match safe_get_nsstring(msg_send![running_app, localizedName]) {
                     Some(name) => name,
                     None => {
-                        error!("Failed to get application name");
+                        eprintln!("Failed to get application name");
                         return;
                     }
                 };
 
                 // Set the app context for logging
-                set_app_context(Some(name.clone()));
+                // Create a separate variable to avoid ownership issues
+                let app_name_for_context = app_name.clone();
+                set_app_context(Some(app_name_for_context));
 
-                info!("Active application changed to: {}", name);
+                // Log safely with basic error printing as fallback
+                match std::panic::catch_unwind(|| {
+                    info!("Active application changed to: {}", app_name);
+                }) {
+                    Err(_) => eprintln!("Logging failed for application change: {}", app_name),
+                    _ => {}
+                }
 
                 // Use a scoped copy of the config to minimize lock time
-                let app_map = config.lock().app.clone();
+                // AVOID catch_unwind here due to RefUnwindSafe issues
+                let app_map = {
+                    // Minimize the time we hold the lock
+                    let locked_config = config.lock();
+                    locked_config.app.clone()
+                };
 
-                if let Some(input_source) = app_map.get(&name) {
+                // Check if we have a configured input source for this app
+                if let Some(input_source) = app_map.get(&app_name) {
+                    // Get current input source safely
                     let current_input_source = get_current_input_source();
-                    if !current_input_source.contains(input_source) {
-                        info!(
-                            "Switching to input source: {} for application: {}",
-                            input_source, name
-                        );
 
-                        // Use a local, owned copy to avoid RefUnwindSafe issues
+                    // Check if we need to switch input sources
+                    if !current_input_source.contains(input_source) {
+                        // Make a clone for the switch operation
                         let input_source_owned = input_source.clone();
 
-                        // Wrap the potentially panicking function in catch_unwind
-                        if let Err(e) = std::panic::catch_unwind(move || {
+                        // Log the switch operation safely
+                        match std::panic::catch_unwind(|| {
+                            info!(
+                                "Switching to input source: {} for application: {}",
+                                input_source, app_name
+                            );
+                        }) {
+                            Err(_) => eprintln!("Logging failed for input source switch"),
+                            _ => {}
+                        }
+
+                        // Perform the actual switch with panic protection
+                        match std::panic::catch_unwind(|| {
                             switch_input_source(&input_source_owned);
                         }) {
-                            error!("Panic when switching input source: {:?}", e);
+                            Err(_) => eprintln!("Panic when switching input source"),
+                            _ => {}
                         }
-                    } else {
-                        debug!(
-                            "Already using correct input source: {}",
-                            current_input_source
-                        );
                     }
-                } else {
-                    debug!("No input source configured for application: {}", name);
                 }
             }
         });
-
         let block = &*block.copy();
 
         info!("Setting up application switch notification observer");

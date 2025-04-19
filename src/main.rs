@@ -276,10 +276,10 @@ async fn ensure_then_load(config_path: &str) -> AppConfig {
         // Richer default configuration, including debug section
         let default_config_str = r#"[app]
 # Examples of application-to-input-source mappings
-# Format: "Application Name" = "InputSourceID"
+# Format: Application Name = "InputSourceID"
 # 
-# "Terminal" = "com.apple.keylayout.US"
-# "Safari" = "com.apple.inputmethod.TCIM.Pinyin"
+# Terminal = "com.apple.keylayout.US"
+# Safari = "com.apple.inputmethod.TCIM.Pinyin"
 
 [debug]
 # Enable debugging

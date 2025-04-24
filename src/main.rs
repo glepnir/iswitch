@@ -7,7 +7,6 @@ use core_foundation::array::{CFArray, CFArrayRef};
 use core_foundation::base::{Boolean, CFTypeRef, TCFType, TCFTypeRef};
 use core_foundation::runloop::CFRunLoopRunInMode;
 use core_foundation::string::{CFString, CFStringRef};
-use lazy_static::lazy_static;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use objc::{class, msg_send, sel, sel_impl};
 use parking_lot::Mutex; // Using parking_lot::Mutex instead of std::sync::Mutex
@@ -17,7 +16,7 @@ use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
@@ -40,20 +39,24 @@ extern "C" {
 const K_TIS_PROPERTY_INPUT_SOURCE_ID: &str = "TISPropertyInputSourceID";
 const K_CF_RUN_LOOP_DEFAULT_MODE: &str = "kCFRunLoopDefaultMode";
 
-// Thread-safe app context using lazy_static and Arc<Mutex<>>
-lazy_static! {
-    static ref APP_CONTEXT: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+// Using OnceLock instead of lazy_static
+static APP_CONTEXT: OnceLock<Arc<Mutex<Option<String>>>> = OnceLock::new();
+
+// Helper function to initialize the APP_CONTEXT
+fn get_app_context_cell() -> &'static Arc<Mutex<Option<String>>> {
+    APP_CONTEXT.get_or_init(|| Arc::new(Mutex::new(None)))
 }
 
 // Enhanced app context handling with parking_lot::Mutex
 fn set_app_context(app_name: Option<String>) {
-    // parking_lot::Mutex doesn't poison on panic
-    *APP_CONTEXT.lock() = app_name;
+    let context = get_app_context_cell();
+    let mut lock = context.lock();
+    *lock = app_name;
 }
 
 fn get_app_context() -> Option<String> {
-    // parking_lot::Mutex doesn't poison on panic
-    APP_CONTEXT.lock().clone()
+    let context = get_app_context_cell();
+    context.lock().clone()
 }
 
 #[derive(Debug, Deserialize, PartialEq, Clone)]
@@ -98,17 +101,18 @@ fn default_log_file() -> String {
     }
 }
 
+// Simplified log_format without catch_unwind
 fn log_format(out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record) {
-    // Safely get app context with a default fallback, without any unwrap
+    // Safely get app context
     let app_context = match get_app_context() {
         Some(ctx) => ctx,
-        None => "iswitch".to_string(),
+        None => "iswitch".to_string(), // Safe default
     };
 
-    // Create timestamp string with safe formatting
+    // Create timestamp string
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    // Use format_args! directly instead of format! to avoid allocation failures
+    // Use a defensive approach to message formatting
     let _ = out.finish(format_args!(
         "{} [{}] [{}] [{}] {}",
         timestamp,
@@ -121,17 +125,14 @@ fn log_format(out: fern::FormatCallback, message: &std::fmt::Arguments, record: 
 
 // Improved console-only logging setup function
 fn setup_console_only_logging() -> Result<(), fern::InitError> {
-    // Use a simpler format function for fallback logging
+    // Use an extremely simple format for console logging
     let fallback_format =
         |out: fern::FormatCallback, message: &std::fmt::Arguments, record: &log::Record| {
-            let _ = out.finish(format_args!(
-                "[{}] [{}] {}",
-                record.level(),
-                record.target(),
-                message
-            ));
+            // Extremely minimal formatter
+            let _ = out.finish(format_args!("[{}] {}", record.level(), message));
         };
 
+    // Create and apply the minimal logger
     match fern::Dispatch::new()
         .format(fallback_format)
         .level(log::LevelFilter::Info)
@@ -139,18 +140,17 @@ fn setup_console_only_logging() -> Result<(), fern::InitError> {
         .apply()
     {
         Ok(_) => {
-            eprintln!("Initialized console-only logging");
+            eprintln!("Initialized minimal console logging");
             Ok(())
         }
         Err(e) => {
-            eprintln!("Failed to initialize console logging: {}", e);
-            // Convert SetLoggerError to InitError
+            eprintln!("Failed to initialize even minimal logging: {}", e);
             Err(fern::InitError::SetLoggerError(e))
         }
     }
 }
 
-// Fixed setup_logging function with proper error handling
+// Fixed setup_logging function
 fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
     if !config.debug.enabled {
         // If debugging is not enabled, only configure basic console logging
@@ -173,61 +173,87 @@ fn setup_logging(config: &AppConfig) -> Result<(), fern::InitError> {
         Err(_) => config.debug.file.clone(), // Keep as is if HOME not available
     };
 
+    // Create log directory with proper error handling
     if let Some(parent) = Path::new(&log_file).parent() {
         if !parent.exists() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("Failed to create log directory: {}", e);
-                return setup_console_only_logging();
+                return setup_console_only_logging(); // Fallback to console
             }
         }
     }
 
-    // Create dispatch with safe error handling for both stdout and file
-    let dispatch = fern::Dispatch::new().format(log_format).level(log_level);
+    // Helper function to create a stdout-only logger
+    let setup_stdout_only = || -> Result<(), fern::InitError> {
+        fern::Dispatch::new()
+            .format(log_format)
+            .level(log_level)
+            .chain(std::io::stdout())
+            .apply()
+            .map_err(|e| fern::InitError::SetLoggerError(e))
+    };
 
-    // First try to set up stdout logging, this should rarely fail
-    let stdout_dispatch = dispatch.chain(std::io::stdout());
-
-    // Then try to set up file logging, but don't fail if it doesn't work
+    // Try to set up combined logging (stdout + file)
     match fern::log_file(&log_file) {
         Ok(file) => {
-            match stdout_dispatch.chain(file).apply() {
+            // Create a new dispatch for combined logging
+            match fern::Dispatch::new()
+                .format(log_format)
+                .level(log_level)
+                .chain(std::io::stdout())
+                .chain(file)
+                .apply()
+            {
                 Ok(_) => {
-                    // Try to log initialization but don't rely on it
-                    match std::panic::catch_unwind(|| {
-                        info!(
-                            "Log system initialized, level: {}, log file: {}",
-                            config.debug.level, log_file
-                        );
-                    }) {
-                        Err(_) => eprintln!("Warning: Failed to log initialization message"),
-                        _ => {}
-                    }
+                    eprintln!(
+                        "Log system initialized, level: {}, log file: {}",
+                        config.debug.level, log_file
+                    );
                     Ok(())
                 }
                 Err(e) => {
                     eprintln!("Failed to setup combined logging: {}", e);
-                    // Convert SetLoggerError to InitError
-                    Err(fern::InitError::SetLoggerError(e))
+                    // Try stdout only as fallback
+                    match setup_stdout_only() {
+                        Ok(_) => {
+                            eprintln!("Falling back to console-only logging");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to initialize even console logging: {}", e);
+                            Err(e)
+                        }
+                    }
                 }
             }
         }
         Err(e) => {
             eprintln!("Failed to open log file {}: {}", log_file, e);
             // Just use stdout logging as fallback
-            match stdout_dispatch.apply() {
+            match setup_stdout_only() {
                 Ok(_) => {
                     eprintln!("Falling back to console-only logging");
                     Ok(())
                 }
                 Err(e) => {
                     eprintln!("Failed to initialize console logging: {}", e);
-                    // Convert SetLoggerError to InitError
-                    Err(fern::InitError::SetLoggerError(e))
+                    Err(e)
                 }
             }
         }
     }
+}
+
+// Function to detect if running in development mode
+fn is_running_in_dev_mode() -> bool {
+    // Check if running via cargo
+    std::env::var("CARGO").is_ok() || 
+    // Or check for a DEBUG environment variable
+    std::env::var("ISWITCH_DEV").is_ok() ||
+    // Check if executable path contains "target/debug"
+    std::env::current_exe()
+        .map(|path| path.to_string_lossy().contains("target/debug"))
+        .unwrap_or(false)
 }
 
 fn get_config_path() -> String {
@@ -277,9 +303,10 @@ async fn ensure_then_load(config_path: &str) -> AppConfig {
         let default_config_str = r#"[app]
 # Examples of application-to-input-source mappings
 # Format: Application Name = "InputSourceID"
-# 
-# Terminal = "com.apple.keylayout.US"
-# Safari = "com.apple.inputmethod.TCIM.Pinyin"
+# InputSourceID can get from iswitch -p
+#
+# Terminal = "com.apple.keylayout.ABC"
+# Safari = "com.apple.inputmethod.SCIM.ITABC"
 
 [debug]
 # Enable debugging
@@ -287,7 +314,7 @@ enabled = false
 # Log level: trace, debug, info, warn, error
 level = "info"
 # Log file path
-file = "~/Library/Logs/iswitch.log"
+file = "~/.config/iswitch/iswitch.log"
 "#;
         if let Err(e) = fs::write(path, default_config_str).await {
             error!("Failed to write default config file: {}", e);
@@ -431,7 +458,7 @@ async fn watch_config_for_changes(
                 ..
             }) = res
             {
-                // parking_lot::Mutex doesn't poison on panic
+                // Direct access without catch_unwind
                 let now = Instant::now();
                 let mut last_update = last_update_time.lock();
                 if now.duration_since(*last_update) > debounce_duration {
@@ -572,7 +599,10 @@ fn print_available_input_sources() {
     }
 }
 
+// Improved function to check if iswitch is already running
 fn is_iswitch_running() -> bool {
+    let current_pid = std::process::id();
+
     let output = match Command::new("pgrep")
         .arg("-f") // Search full command line
         .arg("iswitch")
@@ -585,13 +615,16 @@ fn is_iswitch_running() -> bool {
         }
     };
 
-    // Convert output to string and count lines to determine the number of processes
+    // Convert output to string and parse PIDs
     let output_str = String::from_utf8_lossy(&output.stdout);
-    let process_count = output_str.lines().count();
+    let pids: Vec<u32> = output_str
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|&pid| pid != current_pid) // Exclude current process
+        .collect();
 
-    trace!("iswitch process count: {}", process_count);
-    // If more than 1 process (current one + others), it's already running
-    process_count > 1
+    trace!("Other iswitch processes: {}", pids.len());
+    !pids.is_empty() // Return true if there are other processes
 }
 
 // Add a helper function to safely get NSString values
@@ -643,12 +676,31 @@ async fn main() {
 
     // Get config path and load config
     let config_path = get_config_path();
-    let config = ensure_then_load(&config_path).await;
+    let mut config = ensure_then_load(&config_path).await;
 
-    // Set up logging system with proper error handling
-    if let Err(e) = setup_logging(&config) {
-        eprintln!("Failed to set up logging system: {}", e);
-        // Continue without proper logging
+    // Detect if running in development mode
+    let dev_mode = is_running_in_dev_mode();
+    if dev_mode {
+        eprintln!("Development mode detected, using console logging");
+        config.debug.enabled = true;
+        // Set to trace level for more detailed logs during development
+        config.debug.level = "trace".to_string();
+
+        // Simple console-only setup with minimal chance of failure
+        if let Err(e) = setup_console_only_logging() {
+            eprintln!("WARNING: Failed to set up even minimal logging: {}", e);
+            // Continue without logging
+        }
+    } else {
+        // Set up logging system with proper error handling
+        if let Err(e) = setup_logging(&config) {
+            eprintln!("Failed to set up logging system: {}", e);
+            // Fallback to a minimal console-only logger
+            if let Err(e2) = setup_console_only_logging() {
+                eprintln!("CRITICAL: All logging setup failed: {} and {}", e, e2);
+                // Continue without proper logging
+            }
+        }
     }
 
     info!("iSwitch starting, argument count: {}", args.len());
@@ -657,6 +709,12 @@ async fn main() {
         match args[1].as_str() {
             "-s" => {
                 if args.len() > 2 {
+                    // Check if another instance is already running BEFORE doing anything
+                    if is_iswitch_running() {
+                        info!("Another iswitch instance is already running. This instance will exit after switching.");
+                        // Continue to do the switch, but will exit afterward
+                    }
+
                     let desired_input_source = &args[2];
                     let current_input_source = get_current_input_source();
 
@@ -671,19 +729,12 @@ async fn main() {
                             current_input_source, desired_input_source
                         );
 
-                        // Wrap the potentially panicking function in catch_unwind
-                        if let Err(e) = std::panic::catch_unwind(|| {
-                            switch_input_source(desired_input_source);
-                        }) {
-                            error!("Panic when switching input source: {:?}", e);
-                        }
+                        switch_input_source(desired_input_source);
                     }
 
-                    // Check if another instance is already running
-                    if is_iswitch_running() {
-                        info!("Another iswitch instance is already running. Exiting.");
-                        return;
-                    }
+                    // Always exit after switching in -s mode, don't stay resident
+                    info!("Input source switch complete, exiting.");
+                    return;
                 } else {
                     error!("No input source specified. Usage: -s <input_source_id>");
                     return;
@@ -709,6 +760,13 @@ async fn main() {
                 return;
             }
         }
+    }
+
+    // This part is for daemon mode (no -s, -p, or -h option)
+    info!("Preparing to run in daemon mode");
+    if is_iswitch_running() {
+        error!("Another iswitch instance is already running in daemon mode. Exiting.");
+        return;
     }
 
     info!("Starting main application loop");
@@ -739,13 +797,12 @@ async fn main() {
             return;
         }
 
-        // Properly structured notification handler block without catch_unwind for config access
+        // Properly structured notification handler block without catch_unwind
         let block = ConcreteBlock::new({
             let config = Arc::clone(&config);
             move |notification: id| {
                 // Process notifications with proper error handling
                 if notification.is_null() {
-                    // Use eprintln for critical errors that might happen during logging failure
                     eprintln!("Received null notification");
                     return;
                 }
@@ -772,20 +829,12 @@ async fn main() {
                 };
 
                 // Set the app context for logging
-                // Create a separate variable to avoid ownership issues
-                let app_name_for_context = app_name.clone();
-                set_app_context(Some(app_name_for_context));
+                set_app_context(Some(app_name.clone()));
 
-                // Log safely with basic error printing as fallback
-                match std::panic::catch_unwind(|| {
-                    info!("Active application changed to: {}", app_name);
-                }) {
-                    Err(_) => eprintln!("Logging failed for application change: {}", app_name),
-                    _ => {}
-                }
+                // Log the application change
+                info!("Active application changed to: {}", app_name);
 
                 // Use a scoped copy of the config to minimize lock time
-                // AVOID catch_unwind here due to RefUnwindSafe issues
                 let app_map = {
                     // Minimize the time we hold the lock
                     let locked_config = config.lock();
@@ -802,24 +851,14 @@ async fn main() {
                         // Make a clone for the switch operation
                         let input_source_owned = input_source.clone();
 
-                        // Log the switch operation safely
-                        match std::panic::catch_unwind(|| {
-                            info!(
-                                "Switching to input source: {} for application: {}",
-                                input_source, app_name
-                            );
-                        }) {
-                            Err(_) => eprintln!("Logging failed for input source switch"),
-                            _ => {}
-                        }
+                        // Log the switch operation
+                        info!(
+                            "Switching to input source: {} for application: {}",
+                            input_source, app_name
+                        );
 
-                        // Perform the actual switch with panic protection
-                        match std::panic::catch_unwind(|| {
-                            switch_input_source(&input_source_owned);
-                        }) {
-                            Err(_) => eprintln!("Panic when switching input source"),
-                            _ => {}
-                        }
+                        // Perform the actual switch
+                        switch_input_source(&input_source_owned);
                     }
                 }
             }
@@ -852,7 +891,7 @@ async fn main() {
                 // Load new config outside the mutex lock
                 let new_config = ensure_then_load(&config_path).await;
 
-                // Get a mutex lock and update config
+                // Get a mutex lock and update config safely
                 let mut current_config = config.lock();
 
                 if *current_config != new_config {

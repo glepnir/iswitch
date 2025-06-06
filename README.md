@@ -23,9 +23,9 @@ example config file format
 [app]
 # Examples of application-to-input-source mappings
 # Format: "Application Name" = "InputSourceID"
-# 
-# "Terminal" = "com.apple.keylayout.US"
-# "Safari" = "com.apple.inputmethod.TCIM.Pinyin"
+#
+# Terminal = "com.apple.keylayout.ABC"
+# Safari = "com.apple.inputmethod.SCIM.ITABC"
 
 [debug]
 # Enable debugging

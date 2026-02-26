@@ -24,7 +24,6 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::sync::mpsc::{channel, Sender};
 
-// FFI TODO(glepnir): replace with a package?
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn TISCopyCurrentKeyboardInputSource() -> CFTypeRef;
@@ -421,12 +420,17 @@ async fn main() {
             }
             return; // always exit after -s
         }
+        Some("-v") | Some("--version") => {
+            println!("iswitch {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
         Some("-h") | Some("--help") => {
             println!("iSwitch — auto-switch input sources based on active app\n");
             println!("USAGE:");
             println!("  iswitch              Daemon mode");
             println!("  iswitch -s <id>      Switch to input source");
             println!("  iswitch -p           List input sources");
+            println!("  iswitch -v           Show version");
             println!("  iswitch -h           Help");
             return;
         }
